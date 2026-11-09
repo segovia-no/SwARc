@@ -70,10 +70,18 @@ add_library(recomp_d3d7 SHARED
 target_link_libraries(recomp_d3d7 PUBLIC recomp_win32 recomp_gfx)
 
 # XInput 1.3 on SDL gamepads, and the WMI that tells games which
-# DirectInput game controllers are XInput pads.
+# DirectInput game controllers are XInput pads. With libusb, controllers
+# on an Xbox 360 wireless receiver the host has no driver for too.
 add_library(recomp_xinput SHARED src/win32/xinput.cpp
-            src/win32/wbem.cpp)
+            src/win32/xbox360_receiver.cpp src/win32/wbem.cpp)
 target_link_libraries(recomp_xinput PUBLIC recomp_win32)
+pkg_check_modules(LIBUSB IMPORTED_TARGET libusb-1.0)
+if(LIBUSB_FOUND)
+  target_link_libraries(recomp_xinput PRIVATE PkgConfig::LIBUSB)
+  target_compile_definitions(recomp_xinput PRIVATE RECOMP_X360_RECEIVER)
+else()
+  message(STATUS "libusb-1.0 not found: no Xbox 360 wireless receiver support")
+endif()
 
 # DirectInput 8 (keyboard and mouse) on the event pump's raw input; it
 # lists the XInput pads as game controllers.

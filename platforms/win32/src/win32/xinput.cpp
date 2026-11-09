@@ -5,7 +5,10 @@
 // SDL. Automated runs (<ID>_BACKGROUND) see no pads, as they take no host
 // input. The gamepad subsystem starts on the main thread, where SDL's
 // events are pumped (callers on other threads see no pads until then).
-// DirectInput and WMI list the same pads (xinput.h).
+// DirectInput and WMI list the same pads (xinput.h). Controllers on an
+// Xbox 360 wireless receiver the host has no driver for are read directly
+// (xbox360_receiver.h) and take user indices the same way, with their own
+// XInput subtype (guitars, drums...).
 
 #include <SDL3/SDL.h>
 
@@ -16,6 +19,7 @@
 #include "runtime/log.h"
 #include "win32/hle.h"
 #include "win32/user32_window.h"
+#include "win32/xbox360_receiver.h"
 #include "win32/xinput.h"
 
 namespace recomp::hle {
@@ -26,16 +30,47 @@ constexpr uint32_t ERROR_SUCCESS = 0, ERROR_BAD_ARGUMENTS = 160,
 
 struct Pad {
   SDL_Gamepad* gp = nullptr;
+  int rx = -1;  // receiver slot (gp null)
   uint32_t packet = 0;
   uint8_t last[12] = {};  // XINPUT_GAMEPAD last reported
 };
 
 std::mutex g_mu;
 bool g_up = false;
+bool g_enabled = true;  // XInputEnable
 Pad g_pads[4];
+
+// Gives receiver controllers that connected free user indices and frees
+// those that disconnected; lights each one's quadrant for its index.
+void RefreshReceiver() {
+  x360rx::Start();
+  bool taken[x360rx::kSlots] = {};
+  for (uint32_t i = 0; i < 4; i++) {
+    Pad& p = g_pads[i];
+    if (p.rx < 0) continue;
+    if (!x360rx::Read(p.rx, nullptr)) {
+      p = Pad{};
+      continue;
+    }
+    taken[p.rx] = true;
+    x360rx::SetLed(p.rx, int(i));
+  }
+  for (int s = 0; s < x360rx::kSlots; s++) {
+    if (taken[s] || !x360rx::Read(s, nullptr)) continue;
+    for (uint32_t i = 0; i < 4; i++) {
+      Pad& p = g_pads[i];
+      if (p.gp || p.rx >= 0) continue;
+      p.rx = s;
+      x360rx::SetLed(s, int(i));
+      break;
+    }
+  }
+}
 
 // Opens newly connected gamepads into free slots, frees disconnected ones.
 void Refresh() {
+  if (Background()) return;
+  RefreshReceiver();
   if (!g_up) {
     if (!OnMainThread() || Background()) return;
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
@@ -58,7 +93,7 @@ void Refresh() {
       if (p.gp && SDL_GetGamepadID(p.gp) == ids[i]) open = true;
     if (open) continue;
     for (Pad& p : g_pads) {
-      if (p.gp) continue;
+      if (p.gp || p.rx >= 0) continue;
       p.gp = SDL_OpenGamepad(ids[i]);
       break;
     }
@@ -70,7 +105,7 @@ void Refresh() {
 Pad* PadAt(uint32_t index) {
   if (index >= 4) return nullptr;
   Refresh();
-  return g_pads[index].gp ? &g_pads[index] : nullptr;
+  return g_pads[index].gp || g_pads[index].rx >= 0 ? &g_pads[index] : nullptr;
 }
 
 int16_t Stick(SDL_Gamepad* gp, SDL_GamepadAxis a, bool flip) {
@@ -115,8 +150,14 @@ HLE_NAMED("xinput1_3.dll", "#2", XInputGetState, 2) {
   Pad* p = PadAt(Arg(c, 0));
   if (!p) return ERROR_DEVICE_NOT_CONNECTED;
   if (!Arg(c, 1)) return ERROR_BAD_ARGUMENTS;
-  uint8_t g[12];
-  ReadGamepad(p->gp, g);
+  uint8_t g[12] = {};
+  if (g_enabled) {
+    x360rx::SlotState rs;
+    if (p->gp)
+      ReadGamepad(p->gp, g);
+    else if (x360rx::Read(p->rx, &rs))
+      std::memcpy(g, rs.gamepad, sizeof g);
+  }
   if (std::memcmp(g, p->last, sizeof g) != 0) {
     std::memcpy(p->last, g, sizeof g);
     p->packet++;
@@ -124,6 +165,14 @@ HLE_NAMED("xinput1_3.dll", "#2", XInputGetState, 2) {
   Wr32(Arg(c, 1), p->packet);
   std::memcpy(GPtr(Arg(c, 1) + 4), g, sizeof g);
   return ERROR_SUCCESS;
+}
+
+// XInputEnable(enable): games call it with FALSE when they lose focus.
+// While disabled, pads stay connected but report a neutral state.
+HLE_NAMED("xinput1_3.dll", "#5", XInputEnable, 1) {
+  std::lock_guard<std::mutex> l(g_mu);
+  g_enabled = Arg(c, 0) != 0;
+  return 0;
 }
 
 // XInputSetState(dwUserIndex, pVibration): XINPUT_VIBRATION
@@ -134,13 +183,17 @@ HLE_NAMED("xinput1_3.dll", "#3", XInputSetState, 2) {
   if (!p) return ERROR_DEVICE_NOT_CONNECTED;
   if (!Arg(c, 1)) return ERROR_BAD_ARGUMENTS;
   uint32_t v = Rd32(Arg(c, 1));
-  SDL_RumbleGamepad(p->gp, uint16_t(v), uint16_t(v >> 16), 0xFFFFFFFF);
+  if (p->gp)
+    SDL_RumbleGamepad(p->gp, uint16_t(v), uint16_t(v >> 16), 0xFFFFFFFF);
+  else
+    x360rx::SetRumble(p->rx, uint8_t(v >> 8), uint8_t(v >> 24));
   return ERROR_SUCCESS;
 }
 
 // XInputGetCapabilities(dwUserIndex, dwFlags, pCapabilities):
-// XINPUT_CAPABILITIES {Type, SubType, Flags, Gamepad, Vibration}: a
-// gamepad with every control and both motors.
+// XINPUT_CAPABILITIES {Type, SubType, Flags, Gamepad, Vibration}: every
+// control and both motors; the subtype is a gamepad's, or for a receiver
+// controller the one it announced.
 HLE_NAMED("xinput1_3.dll", "#4", XInputGetCapabilities, 3) {
   std::lock_guard<std::mutex> l(g_mu);
   Pad* p = PadAt(Arg(c, 0));
@@ -150,6 +203,8 @@ HLE_NAMED("xinput1_3.dll", "#4", XInputGetCapabilities, 3) {
   uint8_t caps[20] = {};
   caps[0] = 1;  // XINPUT_DEVTYPE_GAMEPAD
   caps[1] = 1;  // XINPUT_DEVSUBTYPE_GAMEPAD
+  x360rx::SlotState rs;
+  if (!p->gp && x360rx::Read(p->rx, &rs)) caps[1] = rs.subtype;
   const uint16_t buttons = 0xF3FF;
   std::memcpy(caps + 4, &buttons, 2);
   caps[6] = caps[7] = 0xFF;
@@ -167,6 +222,10 @@ std::vector<XInputPad> XInputPads() {
   std::vector<XInputPad> pads;
   for (uint32_t i = 0; i < 4; i++) {
     SDL_Gamepad* gp = g_pads[i].gp;
+    if (g_pads[i].rx >= 0) {  // as Windows lists the receiver's controllers
+      pads.push_back({i, 0x045E, 0x0719, "Controller (Xbox 360 Wireless Receiver for Windows)"});
+      continue;
+    }
     if (!gp) continue;
     const char* name = SDL_GetGamepadName(gp);
     pads.push_back({i, SDL_GetGamepadVendor(gp), SDL_GetGamepadProduct(gp),
