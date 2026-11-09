@@ -6,7 +6,7 @@
 // Documents and Settings/Player/My Documents/...
 //
 // Networking: wsock32 only answers host-name queries (DirectPlay8 is not
-// provided).
+// provided); iphlpapi reports no adapters.
 
 #include <sys/stat.h>
 
@@ -179,6 +179,14 @@ HLE64("shell32.dll", CommandLineToArgvW, 2) {
   }
   Wr32(Arg(c, 1), uint32_t(args.size()));
   return block;
+}
+
+// GetAdaptersInfo(pAdapterInfo, pOutBufLen): no adapters (games use it
+// for a MAC address as a machine ID; they fall back without one).
+constexpr uint32_t kErrorNoData = 232;
+HLE("iphlpapi.dll", GetAdaptersInfo, 2) {
+  if (Arg(c, 1)) Wr32(Arg(c, 1), 0);
+  return kErrorNoData;
 }
 
 }  // namespace recomp::hle

@@ -996,6 +996,22 @@ HLE("kernel32.dll", InterlockedExchange, 2) {
   return __atomic_exchange_n(reinterpret_cast<uint32_t*>(GPtr(Arg(c, 0))),
                              Arg(c, 1), __ATOMIC_SEQ_CST);
 }
+// Returns the value before the add.
+HLE("kernel32.dll", InterlockedExchangeAdd, 2) {
+  GuestSyncPoint sync;
+  return __atomic_fetch_add(reinterpret_cast<uint32_t*>(GPtr(Arg(c, 0))),
+                            Arg(c, 1), __ATOMIC_SEQ_CST);
+}
+// (Destination, Exchange, Comperand): returns the initial value; stores
+// Exchange only if it equalled Comperand.
+HLE("kernel32.dll", InterlockedCompareExchange, 3) {
+  GuestSyncPoint sync;
+  uint32_t expected = Arg(c, 2);
+  __atomic_compare_exchange_n(reinterpret_cast<uint32_t*>(GPtr(Arg(c, 0))),
+                              &expected, Arg(c, 1), false, __ATOMIC_SEQ_CST,
+                              __ATOMIC_SEQ_CST);
+  return expected;
+}
 
 // ---- time ----------------------------------------------------------------
 

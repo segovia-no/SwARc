@@ -344,6 +344,40 @@ uint64_t WaitOne(const Ctx& c) {
   return WaitObjects({w}, false, uint32_t(Arg(c, 1)));
 }
 HLE64("kernel32.dll", WaitForSingleObject, 2) { return WaitOne(c); }
+
+// (hObjectToSignal, hObjectToWaitOn, dwMilliseconds, bAlertable): signals
+// an event (SetEvent), mutex (ReleaseMutex) or semaphore (by 1), then
+// waits on the other object.
+HLE("kernel32.dll", SignalObjectAndWait, 4) {
+  GuestSyncPoint sync;
+  uint32_t sig = Arg(c, 0);
+  if (!SignalEventHandle(sig, false)) {
+    gaddr k32 = ModuleHandle("kernel32.dll");
+    if (!uint32_t(CallGuest(c, ProcAddress(k32, "ReleaseMutex"), {sig})) &&
+        !uint32_t(CallGuest(c, ProcAddress(k32, "ReleaseSemaphore"), {sig, 1, 0}))) {
+      SetLastError(kErrorInvalidHandle);
+      return kWaitFailed;
+    }
+  }
+  auto w = AsWaitable(uint32_t(Arg(c, 1)));
+  if (!w) {
+    SetLastError(kErrorInvalidHandle);
+    return kWaitFailed;
+  }
+  return WaitObjects({w}, false, uint32_t(Arg(c, 2)));
+}
+
+// (hThread, lpExitCode): STILL_ACTIVE (259) until the thread has finished.
+HLE("kernel32.dll", GetExitCodeThread, 2) {
+  auto to = std::dynamic_pointer_cast<ThreadObject>(GetHandle(uint32_t(Arg(c, 0))));
+  if (!to) {
+    SetLastError(kErrorInvalidHandle);
+    return 0;
+  }
+  std::lock_guard<std::mutex> l(g_wait_mu);
+  Wr32(Arg(c, 1), to->finished ? to->exit_code : 259u);
+  return 1;
+}
 HLE64("kernel32.dll", WaitForSingleObjectEx, 3) { return WaitOne(c); }
 
 HLE64("kernel32.dll", WaitForMultipleObjects, 4) {

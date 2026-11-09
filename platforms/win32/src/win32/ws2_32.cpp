@@ -5,14 +5,19 @@
 
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <memory>
+#include <vector>
 
 #include "runtime/log.h"
 #include "win32/hle.h"
@@ -277,6 +282,258 @@ HLE64("ws2_32.dll", inet_ntop, 4) {
   }
   PutStr(Arg(c, 2), buf);
   return Arg(c, 2);
+}
+
+// ---- TCP ----------------------------------------------------------------
+
+RECOMP_WS2(4, connect, 3) {
+  int fd = SocketFd(Arg(c, 0));
+  if (fd < 0) return Fail(kWsaENotSock);
+  sockaddr_storage sa;
+  socklen_t len;
+  if (!ToHost(Arg(c, 1), uint32_t(Arg(c, 2)), &sa, &len)) return Fail(kWsaEAfNoSupport);
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&sa), len) == 0) return 0;
+  // A non-blocking connect in progress is WSAEWOULDBLOCK on Windows.
+  return Fail(errno == EINPROGRESS ? kWsaEWouldBlock : WsaError(errno));
+}
+
+RECOMP_WS2(13, listen, 2) {
+  int fd = SocketFd(Arg(c, 0));
+  if (fd < 0) return Fail(kWsaENotSock);
+  return ::listen(fd, int(Arg(c, 1))) == 0 ? 0 : FailErrno();
+}
+
+RECOMP_WS2(1, accept, 3) {
+  int fd = SocketFd(Arg(c, 0));
+  if (fd < 0) {
+    t_wsa_error = kWsaENotSock;
+    return InvalidSocket();
+  }
+  sockaddr_storage sa{};
+  socklen_t len = sizeof sa;
+  int nfd = ::accept(fd, reinterpret_cast<sockaddr*>(&sa), &len);
+  if (nfd < 0) {
+    t_wsa_error = WsaError(errno);
+    return InvalidSocket();
+  }
+  fcntl(nfd, F_SETFD, FD_CLOEXEC);
+#ifdef SO_NOSIGPIPE
+  int one = 1;
+  setsockopt(nfd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+  ToGuest(sa, Arg(c, 1), Arg(c, 2));
+  auto o = std::make_shared<SocketObject>();
+  o->fd = nfd;
+  return NewHandle(o);
+}
+
+RECOMP_WS2(19, send, 4) {
+  int fd = SocketFd(Arg(c, 0));
+  if (fd < 0) return Fail(kWsaENotSock);
+  ssize_t n = ::send(fd, GPtr(Arg(c, 1)), size_t(uint32_t(Arg(c, 2))),
+                     int(Arg(c, 3)) | kNoSignal);
+  return n < 0 ? FailErrno() : uint64_t(uint32_t(n));
+}
+
+RECOMP_WS2(16, recv, 4) {
+  int fd = SocketFd(Arg(c, 0));
+  if (fd < 0) return Fail(kWsaENotSock);
+  ssize_t n = ::recv(fd, GPtr(Arg(c, 1)), size_t(uint32_t(Arg(c, 2))), int(Arg(c, 3)));
+  return n < 0 ? FailErrno() : uint64_t(uint32_t(n));
+}
+
+RECOMP_WS2(6, getsockname, 3) {
+  int fd = SocketFd(Arg(c, 0));
+  if (fd < 0) return Fail(kWsaENotSock);
+  sockaddr_storage sa{};
+  socklen_t len = sizeof sa;
+  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&sa), &len) != 0) return FailErrno();
+  ToGuest(sa, Arg(c, 1), Arg(c, 2));
+  return 0;
+}
+
+// setsockopt(s, level, name, value, len): Windows' option values mapped to
+// the host's. Unknown options are accepted and ignored, with a warning.
+RECOMP_WS2(21, setsockopt, 5) {
+  int fd = SocketFd(Arg(c, 0));
+  if (fd < 0) return Fail(kWsaENotSock);
+  uint32_t level = uint32_t(Arg(c, 1)), name = uint32_t(Arg(c, 2));
+  gaddr val = Arg(c, 3);
+  uint32_t len = uint32_t(Arg(c, 4));
+  int v = len >= 4 ? int(Rd32(val)) : len >= 1 ? Rd8(val) : 0;
+  int hl = -1, hn = -1;
+  if (level == 0xFFFF) {  // SOL_SOCKET
+    hl = SOL_SOCKET;
+    switch (name) {
+      case 0x0004: hn = SO_REUSEADDR; break;
+      case 0x0008: hn = SO_KEEPALIVE; break;
+      case 0x0020: hn = SO_BROADCAST; break;
+      case 0x1001: hn = SO_SNDBUF; break;
+      case 0x1002: hn = SO_RCVBUF; break;
+      case 0xFFFFFFFB:  // SO_EXCLUSIVEADDRUSE (~SO_REUSEADDR): what BSD sockets do
+        return 0;         // without SO_REUSEADDR anyway
+      case 0xFFFFFF7F: {  // SO_DONTLINGER (~SO_LINGER): BOOL, linger off if set
+        linger l{v ? 0 : 1, 0};
+        return ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof l) == 0 ? 0 : FailErrno();
+      }
+      case 0x0080: {  // SO_LINGER: {u_short onoff, u_short linger}
+        linger l{Rd16(val), Rd16(val + 2)};
+        return ::setsockopt(fd, SOL_SOCKET, SO_LINGER, &l, sizeof l) == 0 ? 0 : FailErrno();
+      }
+      case 0x1005:    // SO_SNDTIMEO, SO_RCVTIMEO: DWORD milliseconds
+      case 0x1006: {
+        timeval tv{v / 1000, (v % 1000) * 1000};
+        return ::setsockopt(fd, SOL_SOCKET, name == 0x1005 ? SO_SNDTIMEO : SO_RCVTIMEO, &tv,
+                            sizeof tv) == 0
+                   ? 0
+                   : FailErrno();
+      }
+    }
+  } else if (level == 6 && name == 1) {  // IPPROTO_TCP, TCP_NODELAY
+    hl = IPPROTO_TCP;
+    hn = TCP_NODELAY;
+  } else if (level == 0) {  // IPPROTO_IP
+    hl = IPPROTO_IP;
+    if (name == 4) hn = IP_TTL;
+  }
+  if (hn < 0) {
+    WarnF("setsockopt(level %u, option %u): ignored\n", level, name);
+    return 0;
+  }
+  return ::setsockopt(fd, hl, hn, &v, sizeof v) == 0 ? 0 : FailErrno();
+}
+
+// fd_set (32-bit): u_int fd_count; SOCKET fd_array[64].
+constexpr uint32_t kFdSetSize = 64;
+
+// select(nfds, readfds, writefds, exceptfds, timeout): on poll(2). The
+// sets are rewritten to hold the ready sockets; timeout is a 32-bit
+// timeval, NULL to wait without limit.
+RECOMP_WS2(18, select, 5) {
+  struct Entry {
+    gaddr set;
+    uint32_t sock;
+    short events;
+  };
+  std::vector<pollfd> fds;
+  std::vector<Entry> entries;
+  const gaddr sets[3] = {Arg(c, 1), Arg(c, 2), Arg(c, 3)};
+  const short ev[3] = {POLLIN, POLLOUT, POLLPRI};
+  for (int k = 0; k < 3; k++) {
+    if (!sets[k]) continue;
+    uint32_t n = std::min(Rd32(sets[k]), kFdSetSize);
+    for (uint32_t i = 0; i < n; i++) {
+      uint32_t s = Rd32(sets[k] + 4 + 4 * i);
+      int fd = SocketFd(s);
+      if (fd < 0) return Fail(kWsaENotSock);
+      fds.push_back({fd, ev[k], 0});
+      entries.push_back({sets[k], s, ev[k]});
+    }
+  }
+  int ms = -1;
+  if (gaddr tv = Arg(c, 4)) ms = int(Rd32(tv)) * 1000 + int(Rd32(tv + 4)) / 1000;
+  int r = ::poll(fds.data(), nfds_t(fds.size()), ms);
+  if (r < 0) return FailErrno();
+  for (int k = 0; k < 3; k++)
+    if (sets[k]) Wr32(sets[k], 0);
+  uint32_t ready = 0;
+  for (size_t i = 0; i < fds.size(); i++) {
+    short got = fds[i].revents;
+    // A failed connect shows in exceptfds on Windows; hangups read as EOF.
+    bool hit = entries[i].events == POLLIN    ? (got & (POLLIN | POLLHUP | POLLERR)) != 0
+               : entries[i].events == POLLOUT ? (got & POLLOUT) != 0
+                                              : (got & (POLLPRI | POLLERR)) != 0;
+    if (!hit) continue;
+    gaddr set = entries[i].set;
+    uint32_t n = Rd32(set);
+    Wr32(set + 4 + 4 * n, entries[i].sock);
+    Wr32(set, n + 1);
+    ready++;
+  }
+  return ready;
+}
+
+RECOMP_WS2(151, __WSAFDIsSet, 2) {
+  uint32_t s = uint32_t(Arg(c, 0));
+  gaddr set = Arg(c, 1);
+  uint32_t n = std::min(Rd32(set), kFdSetSize);
+  for (uint32_t i = 0; i < n; i++)
+    if (Rd32(set + 4 + 4 * i) == s) return 1;
+  return 0;
+}
+
+// WSAAsyncSelect(s, hwnd, msg, events): makes the socket non-blocking, as
+// Windows does. The window notifications themselves are not delivered.
+RECOMP_WS2(101, WSAAsyncSelect, 4) {
+  int fd = SocketFd(Arg(c, 0));
+  if (fd < 0) return Fail(kWsaENotSock);
+  fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+  if (Arg(c, 3)) WarnF("WSAAsyncSelect(events %08X): notifications not delivered\n",
+                       uint32_t(Arg(c, 3)));
+  return 0;
+}
+
+// ---- names ----------------------------------------------------------------
+
+RECOMP_WS2(57, gethostname, 2) {
+  char buf[256] = {};
+  if (::gethostname(buf, sizeof buf - 1) != 0) return FailErrno();
+  if (std::strlen(buf) + 1 > uint32_t(Arg(c, 1))) return Fail(10014);  // WSAEFAULT
+  PutStr(Arg(c, 0), buf);
+  return 0;
+}
+
+// inet_addr(cp) -> the IPv4 address in network order, INADDR_NONE if bad.
+RECOMP_WS2(11, inet_addr, 1) {
+  in_addr a;
+  if (::inet_aton(GStr(Arg(c, 0)).c_str(), &a) == 0) return 0xFFFFFFFFu;
+  return a.s_addr;
+}
+
+// inet_ntoa(in_addr) -> a per-thread static string.
+RECOMP_WS2(12, inet_ntoa, 1) {
+  thread_local gaddr buf = 0;
+  if (!buf) buf = HeapAllocProcess(16, true);
+  in_addr a;
+  a.s_addr = uint32_t(Arg(c, 0));
+  PutStr(buf, ::inet_ntoa(a));
+  return buf;
+}
+
+// gethostbyname(name) -> a per-thread static HOSTENT (32-bit: h_name,
+// h_aliases, short h_addrtype, short h_length, h_addr_list), IPv4 only.
+RECOMP_WS2(52, gethostbyname, 1) {
+  constexpr uint32_t kMaxAddrs = 8, kNameMax = 256;
+  // hostent (16) + alias list (4) + addr list (4 * 9) + addrs (4 * 8) + name.
+  constexpr uint32_t kHostentSize = 16 + 4 + 4 * (kMaxAddrs + 1) + 4 * kMaxAddrs + kNameMax;
+  thread_local gaddr he = 0;
+  if (!he) he = HeapAllocProcess(kHostentSize, true);
+  std::string name = GStr(Arg(c, 0));
+  addrinfo hints{}, *res = nullptr;
+  hints.ai_family = AF_INET;
+  if (::getaddrinfo(name.c_str(), nullptr, &hints, &res) != 0 || !res) {
+    t_wsa_error = 11001;  // WSAHOST_NOT_FOUND
+    return 0;
+  }
+  const gaddr aliases = he + 16, list = aliases + 4, addrs = list + 4 * (kMaxAddrs + 1),
+              hname = addrs + 4 * kMaxAddrs;
+  uint32_t n = 0;
+  for (addrinfo* r = res; r && n < kMaxAddrs; r = r->ai_next) {
+    auto* sin = reinterpret_cast<sockaddr_in*>(r->ai_addr);
+    std::memcpy(GPtr(addrs + 4 * n), &sin->sin_addr, 4);
+    Wr32(list + 4 * n, uint32_t(addrs + 4 * n));
+    n++;
+  }
+  ::freeaddrinfo(res);
+  Wr32(list + 4 * n, 0);
+  Wr32(aliases, 0);
+  PutStr(hname, name.substr(0, kNameMax - 1));
+  Wr32(he + 0, uint32_t(hname));
+  Wr32(he + 4, uint32_t(aliases));
+  Wr16(he + 8, kAfInet);
+  Wr16(he + 10, 4);
+  Wr32(he + 12, uint32_t(list));
+  return he;
 }
 
 }  // namespace recomp::hle

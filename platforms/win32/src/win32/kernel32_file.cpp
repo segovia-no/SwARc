@@ -370,6 +370,41 @@ int FdOf(uint64_t h) {
   return o ? FileFd(o.get()) : -1;
 }
 
+// OVERLAPPED: Internal, InternalHigh (ULONG_PTR each), Offset, OffsetHigh,
+// hEvent. Overlapped transfers complete synchronously, which Windows
+// allows: at the OVERLAPPED's offset (the file pointer is not used),
+// Internal = STATUS_SUCCESS, InternalHigh = the bytes moved, hEvent set.
+struct OverlappedLayout {
+  uint32_t internal_high, offset, event;
+};
+OverlappedLayout OverlappedOf() {
+  return g_proc->x64 ? OverlappedLayout{8, 16, 24} : OverlappedLayout{4, 8, 16};
+}
+
+uint64_t OverlappedTransfer(Ctx& c, int fd, bool write) {
+  gaddr buf = Arg(c, 1), out = Arg(c, 3), ov = Arg(c, 4);
+  uint32_t n = uint32_t(Arg(c, 2));
+  const OverlappedLayout l = OverlappedOf();
+  off_t at = off_t(uint64_t(Rd32(ov + l.offset + 4)) << 32 | Rd32(ov + l.offset));
+  lazy::Touch(buf, n);
+  ssize_t r = !n ? 0 : write ? pwrite(fd, GPtr(buf), n, at) : pread(fd, GPtr(buf), n, at);
+  if (r < 0) {
+    SetLastError(ErrnoToWin(errno));
+    return 0;
+  }
+  if (g_proc->x64) {
+    Wr64(ov, 0);
+    Wr64(ov + l.internal_high, uint64_t(r));
+  } else {
+    Wr32(ov, 0);
+    Wr32(ov + l.internal_high, uint32_t(r));
+  }
+  if (out) Wr32(out, uint32_t(r));
+  uint32_t ev = Rd32(ov + l.event);
+  if (ev) SignalEventHandle(ev, false);
+  return 1;
+}
+
 HLE64("kernel32.dll", ReadFile, 5) {
   int fd = FdOf(Arg(c, 0));
   gaddr buf = Arg(c, 1), out = Arg(c, 3);
@@ -378,7 +413,7 @@ HLE64("kernel32.dll", ReadFile, 5) {
     SetLastError(kErrorInvalidHandle);
     return 0;
   }
-  if (Arg(c, 4)) FatalF("ReadFile with OVERLAPPED is not supported");
+  if (Arg(c, 4)) return OverlappedTransfer(c, fd, false);
   lazy::Touch(buf, n);  // the kernel does not fault on lazy pages
   ssize_t r = n ? read(fd, GPtr(buf), n) : 0;
   if (r < 0) {
@@ -397,6 +432,7 @@ HLE64("kernel32.dll", WriteFile, 5) {
     SetLastError(kErrorInvalidHandle);
     return 0;
   }
+  if (Arg(c, 4)) return OverlappedTransfer(c, fd, true);
   lazy::Touch(buf, n);
   ssize_t r = n ? write(fd, GPtr(buf), n) : 0;
   if (r < 0) {
@@ -406,6 +442,18 @@ HLE64("kernel32.dll", WriteFile, 5) {
   if (out) Wr32(out, uint32_t(r));
   return 1;
 }
+
+// (hFile, lpOverlapped, lpNumberOfBytesTransferred, bWait): overlapped
+// transfers complete synchronously, so the result is always there.
+HLE64("kernel32.dll", GetOverlappedResult, 4) {
+  gaddr ov = Arg(c, 1), out = Arg(c, 2);
+  const OverlappedLayout l = OverlappedOf();
+  if (out) Wr32(out, Rd32(ov + l.internal_high));
+  return 1;
+}
+
+// Nothing is ever pending to cancel.
+HLE64("kernel32.dll", CancelIo, 1) { return 1; }
 
 HLE64("kernel32.dll", SetFilePointer, 4) {
   int fd = FdOf(Arg(c, 0));
@@ -511,6 +559,23 @@ uint32_t GetFileAttributes(const std::string& g) {
 }
 HLE64("kernel32.dll", GetFileAttributesA, 1) { return GetFileAttributes(GStr(Arg(c, 0))); }
 HLE64("kernel32.dll", GetFileAttributesW, 1) { return GetFileAttributes(WidePath(Arg(c, 0))); }
+
+// (lpFileName, fInfoLevelId (GetFileExInfoStandard), lpFileInformation):
+// WIN32_FILE_ATTRIBUTE_DATA {dwFileAttributes, ftCreationTime,
+// ftLastAccessTime, ftLastWriteTime, nFileSizeHigh, nFileSizeLow}.
+HLE("kernel32.dll", GetFileAttributesExA, 3) {
+  struct stat st;
+  uint32_t a;
+  if (!StatGuest(GStr(Arg(c, 0)), &st, &a)) return 0;
+  gaddr o = Arg(c, 2);
+  Wr32(o, a);
+  PutFileTime(o + 4, platform::StatModifyTime(st));
+  PutFileTime(o + 12, platform::StatAccessTime(st));
+  PutFileTime(o + 20, platform::StatModifyTime(st));
+  Wr32(o + 28, uint32_t(uint64_t(st.st_size) >> 32));
+  Wr32(o + 32, uint32_t(st.st_size));
+  return 1;
+}
 
 // GetFileAttributesExW(path, GetFileExInfoStandard, WIN32_FILE_ATTRIBUTE_DATA*).
 HLE64("kernel32.dll", GetFileAttributesExW, 3) {

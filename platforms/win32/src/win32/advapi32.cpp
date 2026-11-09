@@ -214,6 +214,28 @@ HLE("advapi32.dll", GetUserNameA, 2) {
   return 1;
 }
 
+// ---- CryptoAPI: random numbers only -------------------------------------------
+// Games acquire a provider just to call CryptGenRandom (seeds, session ids).
+// The context handle is a non-zero token; CryptGenRandom reads the host's
+// CSPRNG.
+
+constexpr uint32_t kCryptProvToken = 0xC0DE0001;
+
+// (phProv, szContainer, szProvider, dwProvType, dwFlags)
+HLE("advapi32.dll", CryptAcquireContextA, 5) {
+  if (Arg(c, 0)) Wr32(Arg(c, 0), kCryptProvToken);
+  return 1;
+}
+
+HLE("advapi32.dll", CryptReleaseContext, 2) { return 1; }
+
+// (hProv, dwLen, pbBuffer)
+HLE("advapi32.dll", CryptGenRandom, 3) {
+  uint32_t len = Arg(c, 1);
+  if (len) arc4random_buf(GPtr(Arg(c, 2)), len);
+  return 1;
+}
+
 // ---- ole32 ------------------------------------------------------------------
 
 HLE("ole32.dll", CoInitialize, 1) { return 0; }  // S_OK

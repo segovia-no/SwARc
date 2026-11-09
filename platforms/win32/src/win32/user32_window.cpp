@@ -1593,6 +1593,22 @@ HLE("user32.dll", SetWindowTextA, 2) {
   return 1;
 }
 
+// The window keeps its title in the ANSI code page (GetWindowTextA).
+HLE("user32.dll", SetWindowTextW, 2) {
+  std::u16string wt = GWStr(Arg(c, 1));
+  SDL_Window* s = nullptr;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(Arg(c, 0));
+    if (!w) return 0;
+    w->title = Narrow(wt);
+    s = w->sdl;
+  }
+  bool bad = false;
+  if (s) SDL_SetWindowTitle(s, Utf16ToUtf8(wt.data(), wt.size(), &bad).c_str());
+  return 1;
+}
+
 HLE("user32.dll", GetWindowTextA, 3) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(Arg(c, 0));

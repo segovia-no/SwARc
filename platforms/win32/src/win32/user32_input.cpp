@@ -211,6 +211,45 @@ HLE("user32.dll", GetKeyNameTextA, 3) {
 
 HLE("user32.dll", GetKeyboardLayout, 1) { return 0x04090409; }
 
+// (lpKeyState): 256 bytes, bit 7 = down, bit 0 = toggled.
+HLE("user32.dll", GetKeyboardState, 1) {
+  uint32_t out = Arg(c, 0);
+  for (int vk = 0; vk < 256; vk++)
+    Wr8(out + uint32_t(vk), uint8_t((g_key_down[vk] ? 0x80 : 0) | (g_key_toggled[vk] ? 1 : 0)));
+  return 1;
+}
+
+// (uVirtKey, uScanCode, lpKeyState, lpChar, uFlags): the character of a key
+// in the US layout, shifted by lpKeyState's Shift (or Caps Lock for
+// letters). Returns 1 with the character, 0 for keys without one.
+HLE("user32.dll", ToAscii, 5) {
+  uint8_t vk = uint8_t(Arg(c, 0));
+  uint32_t state = Arg(c, 2), out = Arg(c, 3);
+  bool shift = state && (Rd8(state + 0x10) & 0x80);
+  bool caps = state && (Rd8(state + 0x14) & 1);
+  if (Arg(c, 1) & 0x8000) return 0;  // key release
+  const KeyDef* k = ByVk(vk);
+  if (!k || k->ext || !k->ch) return 0;
+  char ch = k->ch;
+  if (ch >= 'a' && ch <= 'z') {
+    if (shift != caps) ch = char(ch - 'a' + 'A');
+  } else if (shift && k->shifted) {
+    ch = k->shifted;
+  }
+  Wr16(out, uint16_t(uint8_t(ch)));
+  return 1;
+}
+
+// (lpsz, cchLength): lower-cases ASCII letters in place; returns the count.
+HLE("user32.dll", CharLowerBuffA, 2) {
+  uint32_t p = Arg(c, 0), n = Arg(c, 1);
+  for (uint32_t i = 0; i < n; i++) {
+    uint8_t ch = Rd8(p + i);
+    if (ch >= 'A' && ch <= 'Z') Wr8(p + i, uint8_t(ch + 32));
+  }
+  return n;
+}
+
 // Key state: bit 15 = down; GetKeyState bit 0 = toggled. GetAsyncKeyState
 // bit 0 = "pressed since last call" (still honoured by Windows XP).
 HLE("user32.dll", GetKeyState, 1) {
