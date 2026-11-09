@@ -309,7 +309,13 @@ uint32_t RunMainThread(Thread* t, const std::function<uint64_t(Ctx&)>& body) {
   if (stack == MAP_FAILED) FatalF("cannot allocate the main guest stack");
   g_main_thread = t;
   g_main_body = &body;
-  platform::RunOnStack(stack, kHostStack, GuestMainTrampoline);
+  // The top of the mapping stays unused (zero, readable): a stack walker on
+  // this thread (backtrace(), called by system frameworks too) follows the
+  // frame chain up to makecontext's first frame and reads the link above
+  // it, which at the very top of the mapping would fault. Above the pad it
+  // reads a null frame pointer and stops.
+  constexpr size_t kTopPad = 64 * 1024;
+  platform::RunOnStack(stack, kHostStack - kTopPad, GuestMainTrampoline);
   munmap(stack, kHostStack);
   return g_main_exit;
 }

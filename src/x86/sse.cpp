@@ -10,6 +10,10 @@
 
 #include "x86/sse.h"
 
+#include <bit>
+#include <cmath>
+#include <type_traits>
+
 extern "C" {
 #include "softfloat.h"
 }
@@ -306,8 +310,11 @@ void CheckAligned(Ctx& c, uint64_t a, uint64_t va, unsigned align) {
            (unsigned long long)a, (unsigned long long)va);
 }
 
-void Arith(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
-           uint64_t va) {
+bool g_fast_path = true;
+void SetFastPath(bool on) { g_fast_path = on; }
+
+void ArithExact(Ctx& c, Op op, bool dbl, int lanes, Xmm& d, const Xmm& s,
+                uint64_t va) {
   if (dbl)
     ArithT<true>(c, op, lanes, d, s, va);
   else
@@ -327,7 +334,7 @@ int Comi(Ctx& c, bool dbl, bool ordered, const Xmm& a, const Xmm& b,
   return dbl ? ComiT<true>(c, ordered, a, b, va) : ComiT<false>(c, ordered, a, b, va);
 }
 
-void Sqrt(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+void SqrtExact(Ctx& c, bool dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
   if (dbl)
     SqrtT<true>(c, lanes, d, s, va);
   else
@@ -373,11 +380,21 @@ uint32_t RsqrtLane(uint32_t x) {
   }
 }
 
-void Rsqrt(Xmm& d, const Xmm& s) {
-  Xmm r;
-  for (int i = 0; i < 4; i++) SetLane<uint32_t>(r, i, RsqrtLane(Lane<uint32_t>(s, i)));
-  d = r;
+uint32_t RcpLane(uint32_t x) {
+  const uint32_t sign = x & 0x80000000u, exp = (x >> 23) & 0xFF, frac = x & 0x7FFFFF;
+  if (exp == 0xFF && frac) return x | 0x00400000u;  // NaN: quieted
+  if (exp == 0) return sign | 0x7F800000u;          // ±0, denormal: ±inf
+  if (exp == 0xFF) return sign;                     // ±inf: ±0
+  const uint_fast8_t mode = softfloat_roundingMode, flags = softfloat_exceptionFlags;
+  softfloat_roundingMode = softfloat_round_near_even;
+  uint32_t r = f32_div(float32_t{0x3F800000u}, float32_t{x}).v;
+  softfloat_roundingMode = mode;
+  softfloat_exceptionFlags = flags;
+  if (((r >> 23) & 0xFF) == 0) return sign;  // denormal result: ±0
+  return r;
 }
+
+
 
 void Cvtsi2sd(Xmm& d, int32_t v) { SetLane<uint64_t>(d, 0, i32_to_f64(v).v); }
 
@@ -413,15 +430,15 @@ uint64_t CvtToI64(Ctx& c, bool dbl, const Xmm& s, bool truncate, uint64_t va) {
   return uint64_t(r);
 }
 
-void MinMax(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
-            uint64_t va) {
+void MinMaxExact(Ctx& c, bool max, bool dbl, int lanes, Xmm& d, const Xmm& s,
+                 uint64_t va) {
   if (dbl)
     MinMaxT<true>(c, max, lanes, d, s, va);
   else
     MinMaxT<false>(c, max, lanes, d, s, va);
 }
 
-void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
+void CvtFloatExact(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va) {
   Scope sc(c, va);
   Xmm r = d;
   if (to_dbl) {
@@ -437,6 +454,19 @@ void CvtFloat(Ctx& c, bool to_dbl, int lanes, Xmm& d, const Xmm& s, uint64_t va)
 }
 
 void CvtIntToF(Ctx& c, bool dbl, bool src64, uint64_t v, Xmm& d, uint64_t va) {
+  // Host fast path for 32-bit sources: int32 to double is exact; to float
+  // rounds to nearest like SoftFloat, inexact iff it does not convert back.
+  if (g_fast_path && !src64 && (c.mxcsr & 0xFFC0) == kMxcsrDefault) {
+    const int32_t i = int32_t(v);
+    if (dbl) {
+      SetLane<uint64_t>(d, 0, std::bit_cast<uint64_t>(double(i)));
+    } else {
+      const float f = float(i);
+      if (double(f) != double(i)) c.mxcsr |= kPE;
+      SetLane<uint32_t>(d, 0, std::bit_cast<uint32_t>(f));
+    }
+    return;
+  }
   Scope sc(c, va);
   sc.Begin();
   if (dbl)

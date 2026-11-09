@@ -26,6 +26,18 @@ target_link_libraries(sse_rsqrt_test PRIVATE recomp_x87)
 target_compile_options(sse_rsqrt_test PRIVATE -O2)
 add_test(NAME sse_rsqrt COMMAND sse_rsqrt_test)
 set_tests_properties(sse_rsqrt PROPERTIES TIMEOUT 300)
+# sse_rcp_test: RCPPS is the correctly rounded 1/x.
+add_executable(sse_rcp_test sse_rcp_test.cpp)
+target_link_libraries(sse_rcp_test PRIVATE recomp_x87)
+target_compile_options(sse_rcp_test PRIVATE -O2)
+add_test(NAME sse_rcp COMMAND sse_rcp_test)
+set_tests_properties(sse_rcp PROPERTIES TIMEOUT 300)
+# sse_fast_test: sse::Arith's host fast path gives SoftFloat's bits and flags.
+add_executable(sse_fast_test sse_fast_test.cpp)
+target_link_libraries(sse_fast_test PRIVATE recomp_x87)
+target_compile_options(sse_fast_test PRIVATE -O2)
+add_test(NAME sse_fast COMMAND sse_fast_test)
+set_tests_properties(sse_fast PROPERTIES TIMEOUT 300)
 
 # hle_abi_test: HLE argument order under the Win64 and System V ABIs.
 add_executable(hle_abi_test hle_abi_test.cpp)
