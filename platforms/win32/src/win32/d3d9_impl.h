@@ -122,6 +122,22 @@ struct Texture : com::Object {
   ~Texture() override;
 };
 
+// IDirect3DVolumeTexture9: levels of width x height x depth texels, kept
+// in guest memory only. There is no gfx 3D texture yet: draws see none
+// bound (shaders sampling a sampler3D get gfx's dummy volume).
+struct VolumeTexture : com::Object {
+  uint32_t device = 0;
+  uint32_t width = 0, height = 0, depth = 0, levels = 0, usage = 0, format = 0, pool = 0;
+  gfx::Format fmt = gfx::Format::Unknown;
+  struct Level {
+    uint32_t w = 0, h = 0, d = 0, row_pitch = 0, slice_pitch = 0;
+    uint32_t mem = 0;  // allocated on first lock or fill
+  };
+  std::vector<Level> lv;
+  uint32_t lod = 0, priority = 0, autogen_filter = 2;  // D3DTEXF_LINEAR
+  ~VolumeTexture() override;
+};
+
 struct Buffer : com::Object {
   uint32_t device = 0;
   bool index = false;
@@ -221,6 +237,16 @@ void SyncState(Device& d);
 uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t h,
                     uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool,
                     uint32_t* out);
+
+// CreateVolumeTexture: the HRESULT; the new texture's guest pointer in *out.
+uint32_t NewVolumeTexture(Device& d, uint32_t device, uint32_t w, uint32_t h, uint32_t depth,
+                          uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool,
+                          uint32_t* out);
+
+// Replaces a whole volume level (slices of `slice_pitch`, rows of `pitch`
+// bytes, in the texture's format): D3DX loaders.
+void FillVolumeLevel(VolumeTexture& t, uint32_t level, const uint8_t* src, uint32_t pitch,
+                     uint32_t slice_pitch);
 
 // D3DXCompileShader's output: a shader function holding the HLSL
 // translation instead of shader model bytecode. Version token, one comment

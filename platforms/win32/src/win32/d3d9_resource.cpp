@@ -28,13 +28,18 @@ constexpr GUID kIID_IDirect3DResource9 = {0x05EEC05D, 0x8F7D, 0x4362, {0xB9, 0x9
 constexpr GUID kIID_IDirect3DSurface9 = {0x0CFBAF3A, 0x9FF6, 0x429A, {0x99, 0xB3, 0xA2, 0x79, 0x6A, 0xF8, 0xB8, 0x9B}};
 constexpr GUID kIID_IDirect3DBaseTexture9 = {0x580CA87E, 0x1D3C, 0x4D54, {0x99, 0x1D, 0xB7, 0xD3, 0xE3, 0xC2, 0x98, 0xCE}};
 constexpr GUID kIID_IDirect3DTexture9 = {0x85C31227, 0x3DE5, 0x4F00, {0x9B, 0x3A, 0xF1, 0x1A, 0xC3, 0x8C, 0x18, 0xB5}};
+constexpr GUID kIID_IDirect3DVolumeTexture9 = {0x2518526C, 0xE789, 0x4111, {0xA7, 0xB9, 0x47, 0xEF, 0x32, 0x8D, 0x13, 0xE6}};
 constexpr GUID kIID_IDirect3DCubeTexture9 = {0xFFF32F81, 0xD953, 0x473A, {0x92, 0x23, 0x93, 0xD6, 0x52, 0xAB, 0xA9, 0x3F}};
 constexpr GUID kIID_IDirect3DVertexBuffer9 = {0xB64BB1B5, 0xFD70, 0x4DF6, {0xBF, 0x91, 0x19, 0xD0, 0xA1, 0x24, 0x55, 0xE3}};
 constexpr GUID kIID_IDirect3DIndexBuffer9 = {0x7C9DD65E, 0xD3F7, 0x4529, {0xAC, 0xEE, 0x78, 0x58, 0x30, 0xAC, 0xDE, 0x35}};
 
 // D3DQUERYTYPE
-constexpr uint32_t D3DQUERYTYPE_EVENT = 8;
-constexpr uint32_t D3DISSUE_END = 0x1;
+constexpr uint32_t D3DQUERYTYPE_EVENT = 8, D3DQUERYTYPE_OCCLUSION = 9;
+constexpr uint32_t D3DISSUE_END = 0x1, D3DISSUE_BEGIN = 0x2;
+// gfx has no occlusion queries: every occlusion query reports all of its
+// samples visible, as this fixed count (large, so a game comparing it with
+// the area it drew sees full visibility; two queries compare as equal).
+constexpr uint32_t kOcclusionAllVisible = 0x00100000;
 
 uint32_t SurfaceVtable() {
   return com::Vtable(
@@ -65,6 +70,16 @@ uint32_t CubeTextureVtable() {
        "SetAutoGenFilterType", "GetAutoGenFilterType", "GenerateMipSubLevels",
        "GetLevelDesc", "GetCubeMapSurface", "LockRect", "UnlockRect",
        "AddDirtyRect"});
+}
+
+uint32_t VolumeTextureVtable() {
+  return com::Vtable(
+      "d3d9.dll", "IDirect3DVolumeTexture9",
+      {"QueryInterface", "AddRef", "Release", "GetDevice", "SetPrivateData",
+       "GetPrivateData", "FreePrivateData", "SetPriority", "GetPriority",
+       "PreLoad", "GetType", "SetLOD", "GetLOD", "GetLevelCount",
+       "SetAutoGenFilterType", "GetAutoGenFilterType", "GenerateMipSubLevels",
+       "GetLevelDesc", "GetVolumeLevel", "LockBox", "UnlockBox", "AddDirtyBox"});
 }
 
 uint32_t BufferVtable(bool index) {
@@ -103,6 +118,7 @@ T* Obj(Ctx& c, const char* iface) {
 
 Surface* Surf(Ctx& c) { return Obj<Surface>(c, "IDirect3DSurface9"); }
 Texture* Tex(Ctx& c) { return Obj<Texture>(c, "IDirect3D{Cube}Texture9"); }
+VolumeTexture* VolTex(Ctx& c) { return Obj<VolumeTexture>(c, "IDirect3DVolumeTexture9"); }
 Buffer* Buf(Ctx& c) { return Obj<Buffer>(c, "IDirect3D{Vertex,Index}Buffer9"); }
 
 uint32_t GetDeviceOf(Ctx& c, uint32_t device) {
@@ -252,6 +268,11 @@ Shader::~Shader() {
   if (d && id) d->gfx->DestroyShader(id);
 }
 
+VolumeTexture::~VolumeTexture() {
+  for (Level& l : lv)
+    if (l.mem) HeapFreeProcess(l.mem);
+}
+
 Texture::~Texture() {
   Device* d = com::As<Device>(device);
   if (d && tex) d->gfx->DestroyTexture(tex);
@@ -309,6 +330,57 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
   RECOMP_TRACE("  Create%sTexture %ux%u x%u fmt %X usage %X pool %u -> %08X\n",
                cube ? "Cube" : "", w, h, levels, fmt, usage, pool, *out);
   return D3D_OK;
+}
+
+uint32_t NewVolumeTexture(Device& d, uint32_t device, uint32_t w, uint32_t h, uint32_t depth,
+                          uint32_t levels, uint32_t usage, uint32_t fmt, uint32_t pool,
+                          uint32_t* out) {
+  (void)d;
+  *out = 0;
+  gfx::Format f = FormatFromD3D(fmt);
+  if (!w || !h || !depth || f == gfx::Format::Unknown || IsDepthFormat(f) ||
+      (usage & D3DUSAGE_RENDERTARGET)) {
+    WarnF("d3d9: CreateVolumeTexture %ux%ux%u fmt %X usage %X pool %u: not supported\n", w,
+          h, depth, fmt, usage, pool);
+    return D3DERR_INVALIDCALL;
+  }
+  uint32_t full = 1;
+  for (uint32_t s = std::max({w, h, depth}); s > 1; s >>= 1) full++;
+  if (!levels || levels > full) levels = full;
+  auto t = std::make_shared<VolumeTexture>();
+  t->device = device;
+  t->width = w;
+  t->height = h;
+  t->depth = depth;
+  t->levels = levels;
+  t->usage = usage;
+  t->format = fmt;
+  t->pool = pool;
+  t->fmt = f;
+  for (uint32_t i = 0; i < levels; i++) {
+    VolumeTexture::Level l;
+    l.w = std::max(1u, w >> i);
+    l.h = std::max(1u, h >> i);
+    l.d = std::max(1u, depth >> i);
+    l.row_pitch = gfx::RowPitch(f, l.w);
+    l.slice_pitch = l.row_pitch * gfx::RowCount(f, l.h);
+    t->lv.push_back(l);
+  }
+  *out = com::Publish(t, VolumeTextureVtable());
+  RECOMP_TRACE("  CreateVolumeTexture %ux%ux%u x%u fmt %X usage %X pool %u -> %08X\n", w, h,
+               depth, levels, fmt, usage, pool, *out);
+  return D3D_OK;
+}
+
+void FillVolumeLevel(VolumeTexture& t, uint32_t level, const uint8_t* src, uint32_t pitch,
+                     uint32_t slice_pitch) {
+  VolumeTexture::Level& l = t.lv[level];
+  if (!l.mem) l.mem = HeapAllocProcess(l.slice_pitch * l.d, true);
+  uint32_t row = gfx::RowPitch(t.fmt, l.w), rows = gfx::RowCount(t.fmt, l.h);
+  for (uint32_t z = 0; z < l.d; z++)
+    for (uint32_t y = 0; y < rows; y++)
+      std::memcpy(GPtr(l.mem + z * l.slice_pitch + y * l.row_pitch),
+                  src + size_t(z) * slice_pitch + size_t(y) * pitch, row);
 }
 
 void FillLevel(Texture& t, uint32_t face, uint32_t level, const uint8_t* src,
@@ -384,6 +456,16 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateTexture", D3DDev9_CreateTexture, 
   uint32_t hr = NewTexture(*Dev(c), Arg(c, 0), false, Arg(c, 1), Arg(c, 2), Arg(c, 3),
                            Arg(c, 4), Arg(c, 5), Arg(c, 6), &out);
   Wr32(Arg(c, 7), out);
+  return hr;
+}
+
+// (Width, Height, Depth, Levels, Usage, Format, Pool, ppVolumeTexture,
+// pSharedHandle)
+HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateVolumeTexture", D3DDev9_CreateVolumeTexture, 10) {
+  uint32_t out;
+  uint32_t hr = NewVolumeTexture(*Dev(c), Arg(c, 0), Arg(c, 1), Arg(c, 2), Arg(c, 3), Arg(c, 4),
+                                 Arg(c, 5), Arg(c, 6), Arg(c, 7), &out);
+  Wr32(Arg(c, 8), out);
   return hr;
 }
 
@@ -531,7 +613,7 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreatePixelShader", D3DDev9_CreatePixel
 // Only EVENT so far: it is signalled at once (draws are not tracked).
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateQuery", D3DDev9_CreateQuery, 3) {
   uint32_t type = Arg(c, 1), out = Arg(c, 2);
-  if (type != D3DQUERYTYPE_EVENT) {
+  if (type != D3DQUERYTYPE_EVENT && type != D3DQUERYTYPE_OCCLUSION) {
     RECOMP_TRACE("  CreateQuery type %u: not available\n", type);
     if (out) Wr32(out, 0);
     return D3DERR_NOTAVAILABLE;
@@ -906,6 +988,82 @@ HLE_NAMED("d3d9.dll", "IDirect3DCubeTexture9::UnlockRect", D3DCube9_UnlockRect, 
 
 HLE_NAMED("d3d9.dll", "IDirect3DCubeTexture9::AddDirtyRect", D3DCube9_AddDirtyRect, 3) { return D3D_OK; }
 
+// ---- IDirect3DVolumeTexture9 -----------------------------------------------------------
+
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::QueryInterface", D3DVol9_QueryInterface, 3) {
+  if (com::GuidEq(Arg(c, 1), kIID_IDirect3DBaseTexture9) ||
+      com::GuidEq(Arg(c, 1), kIID_IDirect3DResource9)) {
+    com::AddRef(Arg(c, 0));
+    Wr32(Arg(c, 2), Arg(c, 0));
+    return D3D_OK;
+  }
+  return QueryInterfaceFor(c, kIID_IDirect3DVolumeTexture9);
+}
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::AddRef", D3DVol9_AddRef, 1) { return com::AddRef(Arg(c, 0)); }
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::Release", D3DVol9_Release, 1) { return com::Release(Arg(c, 0)); }
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetDevice", D3DVol9_GetDevice, 2) { return GetDeviceOf(c, VolTex(c)->device); }
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetType", D3DVol9_GetType, 1) { return D3DRTYPE_VOLUMETEXTURE; }
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::PreLoad", D3DVol9_PreLoad, 1) { return 0; }
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetLevelCount", D3DVol9_GetLevelCount, 1) { return VolTex(c)->levels; }
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::SetPriority", D3DVol9_SetPriority, 2) {
+  VolumeTexture* t = VolTex(c);
+  uint32_t old = t->priority;
+  t->priority = Arg(c, 1);
+  return old;
+}
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetPriority", D3DVol9_GetPriority, 1) { return VolTex(c)->priority; }
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::SetLOD", D3DVol9_SetLOD, 2) {
+  VolumeTexture* t = VolTex(c);
+  uint32_t old = t->lod;
+  if (t->pool == D3DPOOL_MANAGED) t->lod = std::min(uint32_t(Arg(c, 1)), t->levels - 1);
+  return old;
+}
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetLOD", D3DVol9_GetLOD, 1) { return VolTex(c)->lod; }
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::SetAutoGenFilterType", D3DVol9_SetAutoGenFilterType, 2) {
+  VolTex(c)->autogen_filter = Arg(c, 1);
+  return D3D_OK;
+}
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetAutoGenFilterType", D3DVol9_GetAutoGenFilterType, 1) {
+  return VolTex(c)->autogen_filter;
+}
+
+// (Level, pDesc): D3DVOLUME_DESC {Format, Type, Usage, Pool, Width, Height,
+// Depth}.
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::GetLevelDesc", D3DVol9_GetLevelDesc, 3) {
+  VolumeTexture* t = VolTex(c);
+  uint32_t level = Arg(c, 1), out = Arg(c, 2);
+  if (level >= t->levels) return D3DERR_INVALIDCALL;
+  const VolumeTexture::Level& l = t->lv[level];
+  const uint32_t desc[7] = {t->format, 3 /* D3DRTYPE_VOLUME */, t->usage, t->pool, l.w, l.h, l.d};
+  std::memcpy(GPtr(out), desc, sizeof desc);
+  return D3D_OK;
+}
+
+// (Level, pLockedVolume, pBox, Flags): D3DLOCKED_BOX {RowPitch,
+// SlicePitch, pBits}; D3DBOX {Left, Top, Right, Bottom, Front, Back}.
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::LockBox", D3DVol9_LockBox, 5) {
+  VolumeTexture* t = VolTex(c);
+  uint32_t level = Arg(c, 1), out = Arg(c, 2), box = Arg(c, 3);
+  if (level >= t->levels) return D3DERR_INVALIDCALL;
+  VolumeTexture::Level& l = t->lv[level];
+  if (!l.mem) l.mem = HeapAllocProcess(l.slice_pitch * l.d, true);
+  uint32_t off = 0;
+  if (box) {
+    uint32_t left = Rd32(box), top = Rd32(box + 4), front = Rd32(box + 16);
+    off = front * l.slice_pitch +
+          (gfx::IsCompressed(t->fmt)
+               ? (top / 4) * l.row_pitch + (left / 4) * gfx::RowPitch(t->fmt, 4)
+               : top * l.row_pitch + left * gfx::BitsPerPixel(t->fmt) / 8);
+  }
+  Wr32(out, l.row_pitch);
+  Wr32(out + 4, l.slice_pitch);
+  Wr32(out + 8, l.mem + off);
+  return D3D_OK;
+}
+
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::UnlockBox", D3DVol9_UnlockBox, 2) { return D3D_OK; }
+HLE_NAMED("d3d9.dll", "IDirect3DVolumeTexture9::AddDirtyBox", D3DVol9_AddDirtyBox, 2) { return D3D_OK; }
+
 // ---- IDirect3DVertexBuffer9 / IDirect3DIndexBuffer9 ------------------------------------
 
 uint32_t BufferQueryInterface(Ctx& c) {
@@ -1007,15 +1165,23 @@ HLE_NAMED("d3d9.dll", "IDirect3DQuery9::Release", D3DQuery9_Release, 1) { return
 HLE_NAMED("d3d9.dll", "IDirect3DQuery9::GetType", D3DQuery9_GetType, 1) {
   return Obj<Query>(c, "IDirect3DQuery9")->type;
 }
+// EVENT: a BOOL; OCCLUSION: a DWORD sample count.
 HLE_NAMED("d3d9.dll", "IDirect3DQuery9::GetDataSize", D3DQuery9_GetDataSize, 1) {
-  return sizeof(BOOL);  // EVENT
+  return 4;
 }
+// EVENT takes only END; OCCLUSION brackets draws with BEGIN and END.
 HLE_NAMED("d3d9.dll", "IDirect3DQuery9::Issue", D3DQuery9_Issue, 2) {
-  return Arg(c, 1) == D3DISSUE_END ? D3D_OK : D3DERR_INVALIDCALL;
+  const uint32_t flags = Arg(c, 1);
+  if (flags == D3DISSUE_END) return D3D_OK;
+  if (flags == D3DISSUE_BEGIN && Obj<Query>(c, "IDirect3DQuery9")->type == D3DQUERYTYPE_OCCLUSION)
+    return D3D_OK;
+  return D3DERR_INVALIDCALL;
 }
-// (pData, dwSize, dwGetDataFlags): an EVENT is always signalled.
+// (pData, dwSize, dwGetDataFlags): results are always ready. An EVENT is
+// signalled; an OCCLUSION query counts kOcclusionAllVisible samples.
 HLE_NAMED("d3d9.dll", "IDirect3DQuery9::GetData", D3DQuery9_GetData, 4) {
-  if (Arg(c, 1) && Arg(c, 2) >= sizeof(BOOL)) Wr32(Arg(c, 1), 1);
+  const bool occlusion = Obj<Query>(c, "IDirect3DQuery9")->type == D3DQUERYTYPE_OCCLUSION;
+  if (Arg(c, 1) && Arg(c, 2) >= 4) Wr32(Arg(c, 1), occlusion ? kOcclusionAllVisible : 1);
   return D3D_OK;
 }
 

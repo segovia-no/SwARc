@@ -18,6 +18,7 @@
 // implemented: fatal and named.
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -337,14 +338,92 @@ void WriteFormat(uint32_t va, uint32_t size, const Format& f) {
 
 // ---- DirectSoundCreate8 and IDirectSound8
 
-// (lpcGuidDevice, ppDS8, pUnkOuter)
-HLE_NAMED("dsound.dll", "#11", DirectSoundCreate8, 3) {
+// Dev aid: <ID>_AUDIO_DUMP=file.wav records what the mixer plays (32-bit
+// float stereo at 48 kHz). The header's sizes are patched as data comes.
+FILE* g_dump = nullptr;
+uint32_t g_dump_frames = 0;
+void DumpTap(const float* stereo, int frames) {
+  if (!g_dump) return;
+  std::fwrite(stereo, sizeof(float) * 2, size_t(frames), g_dump);
+  g_dump_frames += uint32_t(frames);
+  uint32_t data = g_dump_frames * 8, riff = 36 + data;
+  long at = std::ftell(g_dump);
+  std::fseek(g_dump, 4, SEEK_SET);
+  std::fwrite(&riff, 4, 1, g_dump);
+  std::fseek(g_dump, 40, SEEK_SET);
+  std::fwrite(&data, 4, 1, g_dump);
+  std::fseek(g_dump, at, SEEK_SET);
+}
+void StartDump() {
+  const char* path = Env("AUDIO_DUMP");
+  if (!path || g_dump) return;
+  g_dump = std::fopen(path, "wb");
+  if (!g_dump) return;
+  // RIFF/WAVE, fmt: IEEE float (3), 2 channels, 48000 Hz, 32 bits.
+  const uint32_t rate = 48000, byte_rate = rate * 8, zero = 0, fmt_size = 16;
+  const uint16_t format = 3, channels = 2, align = 8, bits = 32;
+  std::fwrite("RIFF", 1, 4, g_dump);
+  std::fwrite(&zero, 4, 1, g_dump);
+  std::fwrite("WAVEfmt ", 1, 8, g_dump);
+  std::fwrite(&fmt_size, 4, 1, g_dump);
+  std::fwrite(&format, 2, 1, g_dump);
+  std::fwrite(&channels, 2, 1, g_dump);
+  std::fwrite(&rate, 4, 1, g_dump);
+  std::fwrite(&byte_rate, 4, 1, g_dump);
+  std::fwrite(&align, 2, 1, g_dump);
+  std::fwrite(&bits, 2, 1, g_dump);
+  std::fwrite("data", 1, 4, g_dump);
+  std::fwrite(&zero, 4, 1, g_dump);
+  M().SetTap(DumpTap);
+}
+
+// (lpcGuidDevice, ppDS8, pUnkOuter). Imported by ordinal or found by name
+// (GetProcAddress after LoadLibrary("dsound.dll")). DirectSoundCreate
+// returns the same object: IDirectSound8 extends IDirectSound.
+uint32_t CreateDirectSound(Ctx& c) {
   if (!Arg(c, 1)) return DSERR_INVALIDPARAM;
   Wr32(Arg(c, 1), 0);
   if (Arg(c, 2)) return DSERR_NOAGGREGATION;
+  StartDump();
   if (!M().Open(48000)) return DSERR_NODRIVER;
   Wr32(Arg(c, 1), com::Publish(std::make_shared<DirectSound>(), DirectSoundVtable()));
   return DS_OK;
+}
+HLE_NAMED("dsound.dll", "#11", DirectSoundCreate8, 3) { return CreateDirectSound(c); }
+HLE_NAMED("dsound.dll", "DirectSoundCreate8", DirectSoundCreate8ByName, 3) {
+  return CreateDirectSound(c);
+}
+HLE_NAMED("dsound.dll", "#1", DirectSoundCreate, 3) { return CreateDirectSound(c); }
+HLE_NAMED("dsound.dll", "DirectSoundCreate", DirectSoundCreateByName, 3) {
+  return CreateDirectSound(c);
+}
+
+// DirectSoundEnumerateA(lpDSEnumCallback, lpContext): as Windows does, the
+// primary driver (lpGuid NULL) first, then each device with its GUID; here
+// one device, the host's default output. Some callers skip the NULL entry.
+// BOOL CALLBACK cb(LPGUID, LPCSTR description, LPCSTR module, LPVOID ctx);
+// enumeration stops when it returns FALSE.
+uint32_t EnumerateA(Ctx& c) {
+  static const gaddr block = [] {
+    gaddr b = HeapAllocProcess(256, true);
+    PutStr(b, "Primary Sound Driver");
+    PutStr(b + 64, "Speakers");
+    PutStr(b + 128, "{0.0.0.00000000}.{5C1A1E6B-3D7E-4F2A-9B11-6A2F0C4E7D21}");
+    // The device's GUID (any fixed value: DirectSoundCreate opens the
+    // default output whichever GUID it is given).
+    const uint8_t guid[16] = {0x6B, 0x1E, 0x1A, 0x5C, 0x7E, 0x3D, 0x2A, 0x4F,
+                              0x9B, 0x11, 0x6A, 0x2F, 0x0C, 0x4E, 0x7D, 0x21};
+    std::memcpy(GPtr(b + 224), guid, 16);
+    return b;
+  }();
+  if (!Arg(c, 0)) return DSERR_INVALIDPARAM;
+  if (uint32_t(CallGuest(c, Arg(c, 0), {0, block, block + 192, Arg(c, 1)})))
+    CallGuest(c, Arg(c, 0), {block + 224, block + 64, block + 128, Arg(c, 1)});
+  return DS_OK;
+}
+HLE_NAMED("dsound.dll", "#2", DirectSoundEnumerateA, 2) { return EnumerateA(c); }
+HLE_NAMED("dsound.dll", "DirectSoundEnumerateA", DirectSoundEnumerateAByName, 2) {
+  return EnumerateA(c);
 }
 
 HLE_NAMED("dsound.dll", "IDirectSound8::QueryInterface", DS8_QueryInterface, 3) {

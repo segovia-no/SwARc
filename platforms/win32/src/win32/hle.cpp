@@ -30,7 +30,8 @@ const std::vector<std::string>& KnownDlls() {
       "kernel32.dll", "user32.dll",  "gdi32.dll",    "advapi32.dll",
       "ole32.dll",    "version.dll", "winmm.dll",    "wsock32.dll",
       "ddraw.dll",    "mss32.dll",   "binkw32.dll",  "dbghelp.dll",
-      "imm32.dll",    "shfolder.dll", "ntdll.dll",   "opengl32.dll"};
+      "imm32.dll",    "shfolder.dll", "ntdll.dll",   "opengl32.dll",
+      "dsound.dll"};
   return dlls;
 }
 

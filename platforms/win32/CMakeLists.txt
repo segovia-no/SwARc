@@ -88,6 +88,11 @@ target_link_libraries(recomp_d3d9 PUBLIC recomp_win32 recomp_gfx recomp_hlsl)
 # D3DX's maths rounds like the original only without contraction into FMA.
 set_source_files_properties(src/win32/d3dx9.cpp TARGET_DIRECTORY recomp_d3d9
   PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+# JPEG textures (D3DX) decode with ffmpeg's MJPEG decoder when it is there.
+if(FFMPEG_FOUND)
+  target_link_libraries(recomp_d3d9 PRIVATE PkgConfig::FFMPEG)
+  target_compile_definitions(recomp_d3d9 PRIVATE RECOMP_D3DX_JPEG=1)
+endif()
 
 # OpenGL 1.x (opengl32, wgl, gdi32 pixel formats) over gfx::Device.
 add_library(recomp_opengl SHARED

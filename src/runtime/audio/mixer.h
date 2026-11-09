@@ -133,6 +133,10 @@ class Mixer {
 
   // Called by the audio thread.
   void Mix(float* out, int frames);
+  // Dev aid: called with every chunk the device plays (interleaved stereo
+  // floats), on the audio thread. Set before Open.
+  void SetTap(void (*tap)(const float* stereo, int frames)) { tap_ = tap; }
+  void (*tap() const)(const float*, int) { return tap_; }
 
  private:
   void Init(int rate);
@@ -147,6 +151,7 @@ class Mixer {
 
   std::mutex mu_;
   SDL_AudioStream* stream_ = nullptr;
+  void (*tap_)(const float*, int) = nullptr;
   int rate_ = 0;
   float master_ = 1.0f;
   // LowPass coefficients (a1, a2) per 10 mB of HF cut, 0 to -10000.

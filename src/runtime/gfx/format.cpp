@@ -2,6 +2,8 @@
 
 #include "runtime/gfx/device.h"
 
+#include <cstring>
+
 namespace recomp::gfx {
 
 uint32_t BitsPerPixel(Format f) {
@@ -84,7 +86,72 @@ void PutRawPixel(uint8_t* p, Format f, uint32_t v) {
   }
 }
 
+// IEEE half to float.
+float HalfToFloat(uint16_t h) {
+  uint32_t sign = uint32_t(h >> 15) << 31, exp = (h >> 10) & 0x1F, man = h & 0x3FF;
+  uint32_t bits;
+  if (exp == 0) {
+    if (man == 0) {
+      bits = sign;
+    } else {  // subnormal: normalise
+      int e = -1;
+      do {
+        man <<= 1;
+        e++;
+      } while (!(man & 0x400));
+      bits = sign | uint32_t(127 - 15 - e) << 23 | (man & 0x3FF) << 13;
+    }
+  } else if (exp == 31) {
+    bits = sign | 0x7F800000u | man << 13;
+  } else {
+    bits = sign | (exp + 127 - 15) << 23 | man << 13;
+  }
+  float v;
+  std::memcpy(&v, &bits, 4);
+  return v;
+}
+
+// A float channel to 8 bits, clamped to [0, 1] (NaN as 0).
+uint32_t Unorm8(float v) {
+  if (!(v > 0.0f)) return 0;
+  if (v >= 1.0f) return 255;
+  return uint32_t(v * 255.0f + 0.5f);
+}
+
+// Floating-point formats: channels clamped to [0, 1]; channels a format
+// lacks read as 1, as Direct3D samples them.
+uint32_t DecodeFloatPixel(const uint8_t* p, Format f) {
+  float ch[4] = {1.0f, 1.0f, 1.0f, 1.0f};  // R, G, B, A
+  int n = 0;
+  bool half = false;
+  switch (f) {
+    case Format::R16F: n = 1; half = true; break;
+    case Format::G16R16F: n = 2; half = true; break;
+    case Format::A16B16G16R16F: n = 4; half = true; break;
+    case Format::R32F: n = 1; break;
+    case Format::G32R32F: n = 2; break;
+    case Format::A32B32G32R32F: n = 4; break;
+    default: return 0xFFFF00FFu;
+  }
+  for (int i = 0; i < n; i++) {
+    if (half) {
+      uint16_t h;
+      std::memcpy(&h, p + 2 * i, 2);
+      ch[i] = HalfToFloat(h);
+    } else {
+      std::memcpy(&ch[i], p + 4 * i, 4);
+    }
+  }
+  return Unorm8(ch[3]) << 24 | Unorm8(ch[0]) << 16 | Unorm8(ch[1]) << 8 | Unorm8(ch[2]);
+}
+
 uint32_t DecodePixel(const uint8_t* p, Format f) {
+  switch (f) {
+    case Format::R16F: case Format::G16R16F: case Format::A16B16G16R16F:
+    case Format::R32F: case Format::G32R32F: case Format::A32B32G32R32F:
+      return DecodeFloatPixel(p, f);
+    default: break;
+  }
   uint32_t v = RawPixel(p, f);
   switch (f) {
     case Format::A8R8G8B8: return v;

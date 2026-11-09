@@ -415,7 +415,7 @@ class GpuDevice final : public Device {
   ~GpuDevice() override {
     if (!dev_) return;
     SDL_WaitForGPUIdle(dev_);
-    for (SDL_GPUFence* f : in_flight_) SDL_ReleaseGPUFence(dev_, f);
+    for (const InFlight& f : in_flight_) SDL_ReleaseGPUFence(dev_, f.fence);
     for (auto& [t, rd] : reads_) FinishRead(rd, nullptr, 0, Format::Unknown);
     for (auto& [k, p] : pipelines_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
     for (auto& [k, p] : shader_pipelines_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
@@ -1650,14 +1650,21 @@ void r_color0(inout vec4 c) {
   // same size and keeps it for reuse. Unbounded, a burst of flushes with
   // no present to pace it (every texture upload while a level loads) piled
   // up tens of GB of staging memory.
-  void Submit(SDL_GPUCommandBuffer* cmd) {
+  // `staging` is the upload transfer buffer this submission may keep alive
+  // (its size if the flush mapped it, else 0): the wait is bounded by
+  // count and by those bytes, so a burst of large uploads stays capped
+  // while ordinary frames, switching targets many times, are not stalled.
+  void Submit(SDL_GPUCommandBuffer* cmd, size_t staging = 0) {
     SDL_GPUFence* f = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!f) FatalF("gfx: SDL_SubmitGPUCommandBuffer: %s", SDL_GetError());
-    in_flight_.push_back(f);
+    in_flight_.push_back({f, staging});
+    in_flight_bytes_ += staging;
     while (!in_flight_.empty() &&
-           (in_flight_.size() > kMaxInFlight || SDL_QueryGPUFence(dev_, in_flight_.front()))) {
-      SDL_WaitForGPUFences(dev_, true, &in_flight_.front(), 1);
-      SDL_ReleaseGPUFence(dev_, in_flight_.front());
+           (in_flight_.size() > kMaxInFlight || in_flight_bytes_ > kMaxInFlightBytes ||
+            SDL_QueryGPUFence(dev_, in_flight_.front().fence))) {
+      SDL_WaitForGPUFences(dev_, true, &in_flight_.front().fence, 1);
+      SDL_ReleaseGPUFence(dev_, in_flight_.front().fence);
+      in_flight_bytes_ -= in_flight_.front().staging;
       in_flight_.pop_front();
     }
   }
@@ -1809,7 +1816,7 @@ void r_color0(inout vec4 c) {
       }
       SDL_EndGPURenderPass(rp);
     }
-    Submit(cmd);
+    Submit(cmd, total ? upload_tb_cap_ : 0);
 
     cmds_.clear();
     shader_cmds_.clear();
@@ -2587,8 +2594,17 @@ void r_color0(inout vec4 c) {
   SDL_GPUBuffer* ibuf_ = nullptr;
   uint32_t vbuf_cap_ = 0, ibuf_cap_ = 0;
   SDL_GPUTransferBuffer* upload_tb_ = nullptr;
-  static constexpr size_t kMaxInFlight = 4;
-  std::deque<SDL_GPUFence*> in_flight_;  // submitted, not known finished
+  // Every render-target switch submits; games switching targets dozens of
+  // times a frame (shadow maps, post effects) would otherwise wait for the
+  // GPU within the frame. Enough for a couple of frames of submissions.
+  static constexpr size_t kMaxInFlight = 64;
+  struct InFlight {
+    SDL_GPUFence* fence;
+    size_t staging;  // upload transfer buffer bytes it may hold
+  };
+  std::deque<InFlight> in_flight_;  // submitted, not known finished
+  size_t in_flight_bytes_ = 0;
+  static constexpr size_t kMaxInFlightBytes = size_t(256) << 20;
   SDL_GPUTransferBuffer* download_tb_ = nullptr;
   std::map<uint32_t, Read> reads_;  // StartReadBack tickets
   uint32_t next_read_ = 1;

@@ -13,6 +13,12 @@
 // The BINK struct is a guest block: games read Width, Height, Frames
 // (+0x08), FrameNum (+0x0C) and, in 1.8, NumTracks (+0xD0) and the track
 // ID list (+0x250) directly.
+//
+// Frame buffers (1.9): instead of BinkCopyToBuffer, a game may ask for the
+// plane sizes (BinkGetFrameBuffersInfo), allocate the Y/cR/cB/A planes
+// itself (typically locked textures, YUV converted on the GPU) and hand
+// them over (BinkRegisterFrameBuffers). BinkDoFrame then writes each
+// decoded frame's planes into the next frame set and sets FrameNum to it.
 
 #include <algorithm>
 #include <chrono>
@@ -62,8 +68,18 @@ struct Track {
   float volume = 1.0f;
 };
 
+// BINKFRAMEBUFFERS (bink.h, 1.9): a header, then BINKMAXFRAMEBUFFERS (2)
+// frame sets of four planes {Allocate, Buffer, BufferPitch}: Y, cR, cB, A.
+enum : uint32_t {
+  kFbTotalFrames = 0x00, kFbYAWidth = 0x04, kFbYAHeight = 0x08,
+  kFbCWidth = 0x0C, kFbCHeight = 0x10, kFbFrameNum = 0x14, kFbFrames = 0x18,
+  kFbSetSize = 0x30, kFbPlaneSize = 0x0C, kFbMaxFrames = 2,
+};
+enum FbPlane : uint32_t { kPlaneY = 0, kPlaneCr = 1, kPlaneCb = 2, kPlaneA = 3 };
+
 struct Movie {
   uint32_t guest = 0;
+  uint32_t fbufs = 0;  // BinkRegisterFrameBuffers: the game's planes, or 0
   std::vector<uint8_t> data;
   int64_t pos = 0;
   AVFormatContext* fmt = nullptr;
@@ -192,7 +208,70 @@ void QueueAudio(Movie& m, Track& t, AVFrame* f) {
   t.queue->Push(buf.data(), f->nb_samples);
 }
 
+// Copies `rows` rows of `bytes` from src into the guest plane `plane` of
+// frame set `set`, if the game gave it a buffer. The plane's padding (it
+// is `alloc_w` x `alloc_h`, 16-aligned) is filled with `pad`: black in
+// YUV is Y 0, cR/cB 128 (zero chroma bytes would show as green).
+void CopyPlane(uint32_t fb, uint32_t set, FbPlane plane, const uint8_t* src,
+               int src_stride, int bytes, int rows, int alloc_w, int alloc_h, uint8_t pad) {
+  uint32_t p = fb + kFbFrames + set * kFbSetSize + uint32_t(plane) * kFbPlaneSize;
+  uint32_t buf = Rd32(p + 4), pitch = Rd32(p + 8);
+  if (!buf || !src) return;
+  int width = std::min<int>(alloc_w, int(pitch));
+  bytes = std::min<int>(bytes, width);
+  for (int y = 0; y < rows; y++) {
+    uint8_t* row = static_cast<uint8_t*>(GPtr(buf + uint32_t(y) * pitch));
+    std::memcpy(row, src + ptrdiff_t(y) * src_stride, size_t(bytes));
+    if (width > bytes) std::memset(row + bytes, pad, size_t(width - bytes));
+  }
+  for (int y = rows; y < alloc_h; y++)
+    std::memset(GPtr(buf + uint32_t(y) * pitch), pad, size_t(width));
+}
+
+// Frame buffer mode: the decoded frame's planes into the next frame set.
+// ffmpeg's Bink decoder gives YUV420P (YUVA420P with alpha); anything else
+// is converted. cR is V (data[2]), cB is U (data[1]).
+void WriteFrameBuffers(Movie& m) {
+  AVFrame* f = m.frame;
+  AVFrame* src = f;
+  AVFrame* conv = nullptr;
+  bool alpha = f->format == AV_PIX_FMT_YUVA420P;
+  if (f->format != AV_PIX_FMT_YUV420P && !alpha) {
+    conv = av_frame_alloc();
+    conv->format = AV_PIX_FMT_YUVA420P;
+    conv->width = f->width;
+    conv->height = f->height;
+    if (av_frame_get_buffer(conv, 0) < 0) {
+      av_frame_free(&conv);
+      return;
+    }
+    m.sws = sws_getCachedContext(m.sws, f->width, f->height, AVPixelFormat(f->format),
+                                 f->width, f->height, AV_PIX_FMT_YUVA420P, SWS_POINT,
+                                 nullptr, nullptr, nullptr);
+    if (!m.sws) {
+      av_frame_free(&conv);
+      return;
+    }
+    sws_scale(m.sws, f->data, f->linesize, 0, f->height, conv->data, conv->linesize);
+    src = conv;
+    alpha = true;
+  }
+  uint32_t fb = m.fbufs;
+  uint32_t total = std::clamp<uint32_t>(Rd32(fb + kFbTotalFrames), 1, kFbMaxFrames);
+  uint32_t set = (Rd32(fb + kFbFrameNum) + 1) % total;
+  int w = src->width, h = src->height, cw = (w + 1) / 2, ch = (h + 1) / 2;
+  int yaw = int(Rd32(fb + kFbYAWidth)), yah = int(Rd32(fb + kFbYAHeight));
+  int caw = int(Rd32(fb + kFbCWidth)), cah = int(Rd32(fb + kFbCHeight));
+  CopyPlane(fb, set, kPlaneY, src->data[0], src->linesize[0], w, h, yaw, yah, 0);
+  CopyPlane(fb, set, kPlaneCr, src->data[2], src->linesize[2], cw, ch, caw, cah, 128);
+  CopyPlane(fb, set, kPlaneCb, src->data[1], src->linesize[1], cw, ch, caw, cah, 128);
+  if (alpha) CopyPlane(fb, set, kPlaneA, src->data[3], src->linesize[3], w, h, yaw, yah, 0);
+  Wr32(fb + kFbFrameNum, set);
+  av_frame_free(&conv);
+}
+
 void ConvertVideo(Movie& m) {
+  if (m.fbufs) return WriteFrameBuffers(m);
   AVFrame* f = m.frame;
   m.sws = sws_getCachedContext(m.sws, f->width, f->height, AVPixelFormat(f->format),
                                m.w, m.h, AV_PIX_FMT_BGRA, SWS_POINT, nullptr,
@@ -258,7 +337,8 @@ HLE_NAMED("binkw32.dll", "_BinkSetSoundSystem@8", BinkSetSoundSystem, 2) {
   std::lock_guard<std::mutex> l(g_mu);
   uint32_t open = Arg(c, 0);
   g_sound_system = !open ? SoundSystem::None
-                   : open == ThunkFor("binkw32.dll", "_BinkOpenDirectSound@4")
+                   : open == ThunkFor("binkw32.dll", "_BinkOpenDirectSound@4") ||
+                           open == ThunkFor("binkw32.dll", "_BinkOpenWaveOut@4")
                        ? SoundSystem::DirectSound
                        : SoundSystem::Miles;
   return 1;
@@ -290,6 +370,38 @@ HLE_NAMED("binkw32.dll", "_BinkOpenMiles@4", BinkOpenMiles, 1) {
 }
 HLE_NAMED("binkw32.dll", "_BinkOpenDirectSound@4", BinkOpenDirectSound, 1) {
   FatalF("binkw32: BinkOpenDirectSound called directly");
+}
+// waveOut plays through the mixer like DirectSound (BinkSetSoundSystem).
+HLE_NAMED("binkw32.dll", "_BinkOpenWaveOut@4", BinkOpenWaveOut, 1) {
+  FatalF("binkw32: BinkOpenWaveOut called directly");
+}
+
+// BinkSetMemory(alloc, free): Bink's own allocations do not live in guest
+// memory here, so the game's allocator is not needed.
+HLE_NAMED("binkw32.dll", "_BinkSetMemory@8", BinkSetMemory, 2) { return 0; }
+
+// BinkSetIOSize(bytes): the read buffer of the next BinkOpen; movies are
+// read whole.
+HLE_NAMED("binkw32.dll", "_BinkSetIOSize@4", BinkSetIOSize, 1) { return 0; }
+
+// BinkSetFrameRate(rate, div): the frame rate the next BinkOpen uses with
+// BINKFRAMERATE. Movies play at their own rate.
+HLE_NAMED("binkw32.dll", "_BinkSetFrameRate@8", BinkSetFrameRate, 2) { return 0; }
+
+// BinkControlBackgroundIO(HBINK, control): suspends/resumes Bink's reader
+// thread, which does not exist here. Returns 0.
+HLE_NAMED("binkw32.dll", "_BinkControlBackgroundIO@8", BinkControlBackgroundIO, 2) {
+  return 0;
+}
+
+// BinkShouldSkip(HBINK): whether the game should skip showing this frame
+// to catch up. Frames are decoded on demand, so never.
+HLE_NAMED("binkw32.dll", "_BinkShouldSkip@4", BinkShouldSkip, 1) { return 0; }
+
+// BinkGetError() -> the last error message, "" here.
+HLE_NAMED("binkw32.dll", "_BinkGetError@0", BinkGetError, 0) {
+  static gaddr empty = HeapAllocProcess(1, true);
+  return empty;
 }
 
 // The audio track IDs of a Bink file (header: track count at 0x28, from
@@ -448,6 +560,37 @@ HLE_NAMED("binkw32.dll", "_BinkWait@4", BinkWait, 1) {
   auto due = m->start + std::chrono::duration_cast<Clock::duration>(
                             std::chrono::duration<double>((m->frame_num - 1) / m->fps));
   return now < due ? 1 : 0;
+}
+
+// BinkGetFrameBuffersInfo(HBINK, BINKFRAMEBUFFERS*): plane sizes (16-pixel
+// aligned) and which planes to allocate; the game fills in the buffers.
+HLE_NAMED("binkw32.dll", "_BinkGetFrameBuffersInfo@8", BinkGetFrameBuffersInfo, 2) {
+  std::lock_guard<std::mutex> l(g_mu);
+  Movie* m = Find(Arg(c, 0), "BinkGetFrameBuffersInfo");
+  uint32_t fb = Arg(c, 1);
+  if (!m || !fb) return 0;
+  std::memset(GPtr(fb), 0, kFbFrames + kFbMaxFrames * kFbSetSize);
+  auto align16 = [](int v) { return uint32_t((v + 15) & ~15); };
+  Wr32(fb + kFbTotalFrames, kFbMaxFrames);
+  Wr32(fb + kFbYAWidth, align16(m->w));
+  Wr32(fb + kFbYAHeight, align16(m->h));
+  Wr32(fb + kFbCWidth, align16((m->w + 1) / 2));
+  Wr32(fb + kFbCHeight, align16((m->h + 1) / 2));
+  Wr32(fb + kFbFrameNum, kFbMaxFrames - 1);  // the first frame goes to set 0
+  bool alpha = m->vdec && m->vdec->pix_fmt == AV_PIX_FMT_YUVA420P;
+  for (uint32_t s = 0; s < kFbMaxFrames; s++)
+    for (uint32_t p = 0; p < 4; p++)
+      Wr32(fb + kFbFrames + s * kFbSetSize + p * kFbPlaneSize, p != kPlaneA || alpha);
+  return 0;
+}
+
+// BinkRegisterFrameBuffers(HBINK, BINKFRAMEBUFFERS*): from now on frames
+// are decoded into the game's planes. The game may change the buffers
+// (e.g. relock textures) before each BinkDoFrame; they are read then.
+HLE_NAMED("binkw32.dll", "_BinkRegisterFrameBuffers@8", BinkRegisterFrameBuffers, 2) {
+  std::lock_guard<std::mutex> l(g_mu);
+  if (Movie* m = Find(Arg(c, 0), "BinkRegisterFrameBuffers")) m->fbufs = Arg(c, 1);
+  return 0;
 }
 
 // BinkDoFrame(HBINK): decodes the frame FrameNum.

@@ -146,6 +146,7 @@ void SDLCALL AudioCallback(void* ud, SDL_AudioStream* s, int additional, int) {
   while (frames > 0) {
     int n = std::min(frames, kChunk);
     m->Mix(buf, n);
+    if (auto tap = m->tap()) tap(buf, n);
     SDL_PutAudioStreamData(s, buf, n * int(2 * sizeof(float)));
     frames -= n;
   }
