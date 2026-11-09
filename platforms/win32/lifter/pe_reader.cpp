@@ -13,6 +13,8 @@
 namespace lifter {
 namespace {
 
+constexpr uint32_t kScnMemExecute = 0x20000000;  // IMAGE_SCN_MEM_EXECUTE
+
 bool Match(const std::string& path, bool* x64) {
   std::ifstream f(path, std::ios::binary);
   char mz[2] = {};
@@ -53,10 +55,12 @@ bool Load(Program& p, Module& m, const std::string& path, uint64_t base, std::st
     if (s.name == ".text") {
       m.text_lo = s.va;
       m.text_hi = s.va + s.vsize;
+    } else if (s.characteristics & kScnMemExecute) {
+      m.extra_text.push_back({s.va, s.va + s.vsize});
     }
     if (s.name == ".rdata" || s.name == ".data") m.data.push_back({s.va, s.va + s.vsize});
   }
-  auto in_text = [&](uint64_t va) { return va >= m.text_lo && va < m.text_hi; };
+  auto in_text = [&](uint64_t va) { return m.HasCode(va); };
 
   // x64: every .pdata entry that is not a chained fragment starts a
   // function (ARCHITECTURE.md, "64-bit guests"); those with a language

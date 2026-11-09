@@ -21,6 +21,27 @@ struct Module {
   // Where it is mapped, and the base its symbol files and manifest use.
   uint64_t base = 0, preferred_base = 0;
   uint64_t text_lo = 0, text_hi = 0;  // [lo, hi) of .text
+  // --no-x87-doubles (after this module's --exe/--module): its x87 runs get
+  // no host-double path. Code that runs at PC=24 (a thread that created a
+  // Direct3D device without FPU_PRESERVE) never takes that path (it needs
+  // PC=53), so there it only costs code size and compile time.
+  bool x87_doubles = true;
+  // Executable sections besides .text, as [lo, hi) ranges: code that a
+  // protector's unwrapper moved out of .text into a section of its own.
+  std::vector<std::pair<uint64_t, uint64_t>> extra_text;
+  // True if va is in .text or one of the extra executable ranges.
+  bool HasCode(uint64_t va) const {
+    if (va >= text_lo && va < text_hi) return true;
+    for (const auto& [lo, hi] : extra_text)
+      if (va >= lo && va < hi) return true;
+    return false;
+  }
+  // The end of the executable range holding va (HasCode(va) must hold).
+  uint64_t CodeEnd(uint64_t va) const {
+    for (const auto& [lo, hi] : extra_text)
+      if (va >= lo && va < hi) return hi;
+    return text_hi;
+  }
   // Initialised data scanned for code pointers, as [lo, hi) ranges.
   std::vector<std::pair<uint64_t, uint64_t>> data;
   // Read-only data outside .text that may hold switch tables (an ELF's
@@ -59,6 +80,7 @@ struct Program {
   std::vector<Module> modules;  // [0] is the EXE
   bool x64 = false;  // x64 images (all modules are one or the other)
 
+
   std::set<uint64_t> entries;                 // function entry points
   // Entries known only from pointer scans (a dword in data or an
   // immediate that happens to point into .text). They get their own
@@ -67,6 +89,10 @@ struct Program {
   // at all, and splitting a loop at one turned every iteration into a
   // nested host call (a "freeze" that was really deepening recursion).
   std::set<uint64_t> weak;
+  // manifest `noentry`: values the pointer scans must not take as code
+  // addresses (constants such as colours or flags that happen to point
+  // into code; each one would lift the rest of a function again).
+  std::set<uint64_t> noentry;
 
   // True if control reaching t from another function leaves that function
   // (a tail call) rather than continuing inline.
@@ -104,15 +130,16 @@ struct Program {
   // resume/replace/setjmp lines, VAs at its preferred base).
   bool LoadManifest(const std::string& path, std::string* err);
 
-  // The module whose .text contains va, or null.
+  // The module whose code (.text or an extra executable section)
+  // contains va, or null.
   const Module* TextOf(uint64_t va) const {
     for (const auto& m : modules)
-      if (va >= m.text_lo && va < m.text_hi) return &m;
+      if (m.HasCode(va)) return &m;
     return nullptr;
   }
   bool InText(uint64_t va) const { return TextOf(va) != nullptr; }
   const uint8_t* Bytes(uint64_t va) const { return mem.ptr<uint8_t>(va); }
-  size_t BytesLeft(uint64_t va) const { return TextOf(va)->text_hi - va; }
+  size_t BytesLeft(uint64_t va) const { return TextOf(va)->CodeEnd(va) - va; }
 };
 
 }  // namespace lifter

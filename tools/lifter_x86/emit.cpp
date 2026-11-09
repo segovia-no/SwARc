@@ -1560,6 +1560,9 @@ void InsnEmitter::EmitSse() {
       L(Fmt("::recomp::sse::%s(%s, %s);", fn, XmmRef(0).c_str(), s.c_str()));
       return;
     }
+    // MOVNTPS/MOVNTPD/MOVNTDQ: aligned stores with a non-temporal hint,
+    // which only affects caching; the stored value is MOVAPS's.
+    case ZYDIS_MNEMONIC_MOVNTPS: case ZYDIS_MNEMONIC_MOVNTPD: case ZYDIS_MNEMONIC_MOVNTDQ:
     case ZYDIS_MNEMONIC_MOVAPS: case ZYDIS_MNEMONIC_MOVAPD: case ZYDIS_MNEMONIC_MOVUPS:
     case ZYDIS_MNEMONIC_MOVUPD: case ZYDIS_MNEMONIC_MOVDQA: case ZYDIS_MNEMONIC_MOVDQU:
       if (IsXmm(0)) {
@@ -1694,6 +1697,18 @@ void InsnEmitter::EmitSse() {
       std::string s = src(1);
       L(Fmt("::recomp::sse::Sqrt(c, %s, %d, %s, %s, %s);", b(dbl), lanes, XmmRef(0).c_str(),
             s.c_str(), va.c_str()));
+      return;
+    }
+    case ZYDIS_MNEMONIC_RCPPS: {
+      if (!IsXmm(0)) return Unimpl();
+      std::string s = src(1);
+      L(Fmt("::recomp::sse::Rcp(%s, %s);", XmmRef(0).c_str(), s.c_str()));
+      return;
+    }
+    case ZYDIS_MNEMONIC_RCPSS: {
+      if (!IsXmm(0)) return Unimpl();
+      std::string s = src(1);
+      L(Fmt("::recomp::sse::RcpSs(%s, %s);", XmmRef(0).c_str(), s.c_str()));
       return;
     }
     case ZYDIS_MNEMONIC_RSQRTPS: {
@@ -3118,7 +3133,8 @@ void Emitter::EmitX87Run(const Function& f, std::map<uint64_t, Insn>::const_iter
   std::string dbody;
   std::vector<uint64_t> resume;
   bool doubles = false;
-  for (auto j = first; j != end; ++j)
+  const Module* mod = p_.TextOf(first->first);
+  for (auto j = first; mod && mod->x87_doubles && j != end; ++j)
     if (IsX87(j->second.d) && (X87OpName(j->second.d.mnemonic) ||
                                j->second.d.mnemonic == ZYDIS_MNEMONIC_FSQRT))
       doubles = true;

@@ -31,6 +31,7 @@
 // consistently. Then the functions are emitted into generated/gen_NNN.cpp
 // plus a table file.
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <deque>
@@ -92,6 +93,7 @@ const char* kFilePrologue =
 struct ModuleArgs {
   std::string path, symdir, manifest;
   uint64_t base = 0;
+  bool no_x87_doubles = false;
 };
 
 int main(int argc, char** argv) {
@@ -110,6 +112,7 @@ int main(int argc, char** argv) {
     else if (a == "--manifest") mods.back().manifest = val();
     else if (a == "--base") mods.back().base = std::stoull(val(), nullptr, 16);
     else if (a == "--out") outdir = val();
+    else if (a == "--no-x87-doubles") mods.back().no_x87_doubles = true;
     else if (a == "--insns-per-file") per_file = std::stoull(val());
     else if (a == "--dump") dump = std::stoull(val(), nullptr, 16);
     else if (a == "--x87-test") x87_test = val();
@@ -131,7 +134,7 @@ int main(int argc, char** argv) {
   }
   if (mods[0].path.empty()) {
     std::fprintf(stderr, "usage: recomp_lift --exe game.exe "
-                         "[--symbols dir] [--out dir] "
+                         "[--symbols dir] [--out dir] [--no-x87-doubles] "
                          "[--module game.dll --symbols dir]...\n");
     return 2;
   }
@@ -147,6 +150,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "manifest: %s\n", err.c_str());
       return 1;
     }
+    p.modules.back().x87_doubles = !m.no_x87_doubles;
   }
   lifter::Decoder dec(p.x64);
   // Files lifted from x64 images see lifted.h's x64 register model.
@@ -205,7 +209,7 @@ int main(int argc, char** argv) {
   std::set<uint64_t> done;
   size_t from_code_ptrs = 0, from_data_ptrs = 0;
   auto candidate = [&](const lifter::Module* m, uint64_t t, size_t* counter) {
-    if (p.TextOf(t) != m || p.entries.count(t)) return;
+    if (p.TextOf(t) != m || p.entries.count(t) || p.noentry.count(t)) return;
     lifter::Insn in;
     if (!dec.Decode(p, t, &in)) return;
     p.entries.insert(t);
@@ -223,7 +227,7 @@ int main(int argc, char** argv) {
         for (uint64_t a = lo; a + 4 <= hi; a += 4)
           candidate(&m, p.mem.read<uint32_t>(a), &from_data_ptrs);
     }
-  size_t recovered_tables = 0;
+  size_t recovered_tables = 0, merged_tables = 0;
   while (!work.empty()) {
     uint64_t e = work.front();
     work.pop_front();
@@ -236,9 +240,23 @@ int main(int argc, char** argv) {
       more = false;
       for (const auto& [va, in] : f.insns) {
         std::vector<uint64_t> targets;
-        if (p.jumptables.count(va) ||
-            !lifter::RecoverJumpTable(p, f, in, &targets))
+        if (!lifter::RecoverJumpTable(p, f, in, &targets)) continue;
+        // Ghidra sometimes lists only some of a table's targets: merge in
+        // the ones the recovery reads from the table itself.
+        auto it = p.jumptables.find(va);
+        if (it != p.jumptables.end()) {
+          bool grew = false;
+          for (uint64_t t : targets)
+            if (std::find(it->second.begin(), it->second.end(), t) == it->second.end()) {
+              it->second.push_back(t);
+              grew = true;
+            }
+          if (grew) {
+            merged_tables++;
+            more = true;
+          }
           continue;
+        }
         p.jumptables[va] = std::move(targets);
         recovered_tables++;
         more = true;
@@ -274,8 +292,8 @@ int main(int argc, char** argv) {
               "%zu via code pointers, %zu via data pointers; %zu weak)\n",
               p.entries.size(), initial, p.entries.size() - initial,
               from_code_ptrs, from_data_ptrs, p.weak.size());
-  std::printf("jump tables: %zu from Ghidra, %zu recovered\n",
-              p.jumptables.size() - recovered_tables, recovered_tables);
+  std::printf("jump tables: %zu from Ghidra (%zu completed), %zu recovered\n",
+              p.jumptables.size() - recovered_tables, merged_tables, recovered_tables);
 
   // Pass 2: final CFGs and emission.
   std::filesystem::create_directories(outdir);

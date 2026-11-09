@@ -87,7 +87,7 @@ bool Program::Load(const std::string& path, const std::string& symdir,
   // Symbol files hold VAs at the preferred base; a moved module's are
   // shifted by the same delta as its relocations.
   const uint64_t delta = m.base - m.preferred_base;
-  auto in_text = [&](uint64_t va) { return va >= m.text_lo && va < m.text_hi; };
+  auto in_text = [&](uint64_t va) { return m.HasCode(va); };
 
   // Ghidra's function list: entry, min, max, chunks, thunk, noreturn,
   // callconv, name.
@@ -156,6 +156,8 @@ bool Program::LoadManifest(const std::string& path, std::string* err) {
     } else if (kind == "probe") {
       entries.insert(va);
       probes[va] = name.empty() ? "probe" : name;
+    } else if (kind == "noentry") {
+      noentry.insert(va);
     } else if (kind == "replace") {
       entries.insert(va);
       replaced.insert(va);
