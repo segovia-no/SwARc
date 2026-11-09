@@ -62,6 +62,12 @@ struct GameConfig : recomp::GameConfig {
   struct LiftedDll {
     std::string name;   // file name, e.g. "game.dll"
     uint32_t base = 0;  // the lifter's --base for it; 0 = preferred base
+    // Imported by the EXE or by another lifted DLL, not only loaded with
+    // LoadLibrary (e.g. the C runtime DLL of the compiler the game was
+    // built with): mapped before the EXE, in list order (a DLL after the
+    // DLLs it imports), its exports bound into its importers' IATs, and
+    // its DllMain run before the EXE's entry point. It is never unloaded.
+    bool static_import = false;
   };
   std::vector<LiftedDll> lifted_dlls;
 };
@@ -94,6 +100,7 @@ struct Module {
   int refs = 0;        // LoadLibrary count (under kernel32's loader lock)
   bool stale = false;  // has run since it was mapped: map afresh on load
   int tls_index = -1;  // its static TLS slot (x64 guests), -1: none
+  bool static_import = false;  // GameConfig::LiftedDll::static_import
 };
 
 // The Win32 side of g_proc.

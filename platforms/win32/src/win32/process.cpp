@@ -36,6 +36,16 @@ std::pair<gaddr, uint64_t> TextOf(const PeImage& img) {
   return {0, 0};
 }
 
+// The image's other executable sections: code a protector's unwrapper
+// moved out of .text, lifted like .text (the lifter's PE reader).
+std::vector<std::pair<gaddr, uint64_t>> ExtraCodeOf(const PeImage& img) {
+  std::vector<std::pair<gaddr, uint64_t>> r;
+  for (const auto& s : img.sections)
+    if (s.name != ".text" && (s.characteristics & 0x20000000))  // MEM_EXECUTE
+      r.push_back({s.va, s.vsize});
+  return r;
+}
+
 // Process::thread_init: the thread's TEB and TLS array, in the layout of
 // the process's mode, found through fs (32-bit) or gs (x64).
 void InitTeb(Thread* t) {
@@ -108,11 +118,28 @@ const PeImage* ImageAt(gaddr va) {
   return nullptr;
 }
 
+// An IAT slot's value: the export of a statically imported lifted DLL
+// mapped before the importer, else the HLE thunk.
+gaddr BindImportSlot(const std::string& dll, const std::string& name) {
+  const std::string n = hle::NormaliseDll(dll);
+  for (const Module& m : g_win32->modules) {
+    if (m.name != n || !m.static_import || !m.img.image_size) continue;
+    const bool by_ordinal = !name.empty() && name[0] == '#';
+    const uint32_t ordinal = by_ordinal ? uint32_t(std::stoul(name.substr(1))) : 0;
+    for (const PeExport& e : m.img.exports)
+      if (by_ordinal ? e.ordinal == ordinal : e.name == name) return e.va;
+    FatalF("import %s!%s: the lifted DLL has no such export (forwarded exports "
+           "are not supported)",
+           n.c_str(), name.c_str());
+  }
+  return hle::ImportThunk(dll, name);
+}
+
 void MapModule(Module& m) {
   Process& p = *g_proc;
   if (m.img.image_size) p.mem.Decommit(m.img.image_base, m.img.image_size);
   std::string err;
-  if (!m.img.Load(m.host_path, p.mem, &err, m.base, hle::ImportThunk))
+  if (!m.img.Load(m.host_path, p.mem, &err, m.base, BindImportSlot))
     FatalF("lifted DLL %s: %s", m.name.c_str(), err.c_str());
   // Windows XP did not set up static TLS for LoadLibrary'd DLLs either,
   // so 32-bit DLLs of that era have none. x64 ones get a slot of their own
@@ -145,16 +172,20 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   };
   p.pump_events = PumpHostEvents;
   w.game_args = game_args;
-  std::string err;
-  if (!w.img.Load(exe_path, p.mem, &err, 0, hle::ImportThunk))
-    FatalF("%s", err.c_str());
+  // Lifted DLLs first, so the EXE's imports of statically imported ones
+  // bind to their exports (BindImportSlot).
+  w.modules.reserve(game.lifted_dlls.size());
   for (const auto& d : game.lifted_dlls) {
     Module& m = w.modules.emplace_back();
     m.name = hle::NormaliseDll(d.name);
     m.host_path = HostPath(GuestGameDir() + "\\" + d.name);
     m.base = d.base;
+    m.static_import = d.static_import;
     MapModule(m);
   }
+  std::string err;
+  if (!w.img.Load(exe_path, p.mem, &err, 0, BindImportSlot))
+    FatalF("%s", err.c_str());
 
   if (p.x64) {
     // Everything above 4 GiB, below the TEBs.
@@ -195,6 +226,9 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   // Dispatch looks lifted code up in each image's .text: the EXE's first.
   p.code.push_back(TextOf(w.img));
   for (const Module& m : w.modules) p.code.push_back(TextOf(m.img));
+  for (const auto& r : ExtraCodeOf(w.img)) p.code.push_back(r);
+  for (const Module& m : w.modules)
+    for (const auto& r : ExtraCodeOf(m.img)) p.code.push_back(r);
   InitDispatch();
   for (const Module& m : w.modules) {
     // A DLL lifted at another base, or not at all, has no functions here.
@@ -207,7 +241,18 @@ int RunProcess(const win32::GameConfig& game, const std::string& exe_path,
   InitKernel32State();
 
   Thread* main = CreateGuestThread(w.img.stack_reserve);
-  return int(RunMainThread(main, [&](Ctx& c) { return CallGuest(c, w.img.entry, {}); }));
+  return int(RunMainThread(main, [&](Ctx& c) {
+    // DLL_PROCESS_ATTACH of statically imported DLLs, in load order, as
+    // the Windows loader runs them before the EXE's entry point.
+    for (Module& m : w.modules) {
+      if (!m.static_import || !m.img.entry) continue;
+      m.refs = 1;
+      m.stale = true;
+      if (!uint32_t(CallGuest(c, m.img.entry, {m.img.image_base, 1, 0})))
+        FatalF("%s: DllMain(DLL_PROCESS_ATTACH) failed", m.name.c_str());
+    }
+    return CallGuest(c, w.img.entry, {});
+  }));
 }
 
 }  // namespace recomp

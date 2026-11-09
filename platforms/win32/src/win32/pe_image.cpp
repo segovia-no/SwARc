@@ -67,6 +67,8 @@ bool PeImage::Load(const std::string& path, GuestMemory& mem,
   preferred_base = x64 ? Rd<uint64_t>(d, oh + 24) : Rd<uint32_t>(d, oh + 28);
   image_base = base ? base : preferred_base;
   image_size = Rd<uint32_t>(d, oh + 56);
+  uint32_t section_align = Rd<uint32_t>(d, oh + 32);
+  if (!section_align || (section_align & (section_align - 1))) section_align = 0x1000;
   uint32_t headers_size = Rd<uint32_t>(d, oh + 60);
   stack_reserve = x64 ? Rd<uint64_t>(d, oh + 72) : Rd<uint32_t>(d, oh + 72);
   if (entry) entry += image_base;  // DLLs may have no entry point
@@ -112,13 +114,18 @@ bool PeImage::Load(const std::string& path, GuestMemory& mem,
     uint32_t rsize = Rd<uint32_t>(d, o + 16);
     uint32_t rptr = Rd<uint32_t>(d, o + 20);
     uint32_t ch = Rd<uint32_t>(d, o + 36);
-    uint32_t n = std::min(vsize ? vsize : rsize, rsize);
+    // Windows maps a section's raw data up to its virtual size rounded up
+    // to the section alignment, so bytes past VirtualSize in its last page
+    // are loaded too (patched executables put code there). The section
+    // then extends over them.
+    uint32_t span = vsize ? (vsize + section_align - 1) & ~(section_align - 1) : rsize;
+    uint32_t n = std::min(span, rsize);
     if (rptr + n > d.size()) {
       *err = std::string("section ") + name + " runs past end of file";
       return false;
     }
     std::memcpy(mem.ptr(image_base + va), d.data() + rptr, n);
-    sections.push_back({name, image_base + va, vsize, ch});
+    sections.push_back({name, image_base + va, std::max(vsize, n), ch});
   }
 
   // Base relocations: add the load delta to every HIGHLOW (and, in x64
