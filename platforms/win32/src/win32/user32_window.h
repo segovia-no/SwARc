@@ -18,6 +18,11 @@ SDL_Window* SdlWindowFor(uint32_t hwnd);
 uint32_t DcForWindow(uint32_t hwnd);
 uint32_t WindowForDc(uint32_t hdc);
 
+// Whether the host pointer may be grabbed (relative mode) for w now: not
+// in automated runs, and with GameConfig::grab_pointer_in_window false
+// only while w is fullscreen.
+bool PointerGrabAllowed(SDL_Window* w);
+
 // Whether the caller is the guest's main thread (the one SDL's video and
 // events belong to).
 bool OnMainThread();

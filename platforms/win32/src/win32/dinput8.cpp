@@ -156,11 +156,14 @@ void OnRawInput(const RawInput& in) {
 }
 
 // The exclusive mouse hides the pointer and reports motion without
-// bounds, as on Windows: SDL's relative mode on the device's window.
+// bounds, as on Windows: SDL's relative mode on the device's window
+// (unless the game keeps the pointer free in a window, PointerGrabAllowed;
+// motion and buttons arrive either way).
 void Grab(InputDevice& d, bool on) {
   if (d.grabbed == on || d.keyboard || !(d.coop & DISCL_EXCLUSIVE) || Background())
     return;
-  if (SDL_Window* w = SdlWindowFor(d.hwnd)) SDL_SetWindowRelativeMouseMode(w, on);
+  SDL_Window* w = SdlWindowFor(d.hwnd);
+  if (w && (!on || PointerGrabAllowed(w))) SDL_SetWindowRelativeMouseMode(w, on);
   d.grabbed = on;
 }
 

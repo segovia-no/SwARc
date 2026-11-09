@@ -407,7 +407,16 @@ void AttachClip() {
     g_clip.hwnd = ClipWindow();
     if (Window* w = Win(g_clip.hwnd)) grab = w->sdl;
   }
-  if (grab && !Background()) SDL_SetWindowRelativeMouseMode(grab, true);
+  if (grab && PointerGrabAllowed(grab)) SDL_SetWindowRelativeMouseMode(grab, true);
+}
+
+// GameConfig::quit_on_close_request: the host asked to quit, so end the
+// process the way ExitProcess(0) does.
+[[noreturn]] void QuitNow(const char* why) {
+  std::fflush(stdout);
+  std::fprintf(stderr, "quit requested (%s): exiting\n", why);
+  std::fflush(stderr);
+  std::_Exit(0);
 }
 
 void ActivateApp(uint32_t hwnd, bool active) {
@@ -430,12 +439,14 @@ void ActivateApp(uint32_t hwnd, bool active) {
 void HandleSdlEvent(const SDL_Event& e) {
   switch (e.type) {
     case SDL_EVENT_QUIT: {
+      if (Game().quit_on_close_request) QuitNow("host quit");
       std::lock_guard<std::recursive_mutex> l(g_mu);
       for (auto& [h, w] : g_windows)
         if (w.sdl && !w.destroyed) Post(h, WM_CLOSE, 0, 0);
       break;
     }
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+      if (Game().quit_on_close_request) QuitNow("window closed");
       if (uint32_t h = HwndForSdl(e.window.windowID)) Post(h, WM_CLOSE, 0, 0);
       break;
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
@@ -1068,6 +1079,11 @@ SDL_Window* SdlWindowFor(uint32_t hwnd) {
   std::lock_guard<std::recursive_mutex> l(g_mu);
   Window* w = Win(hwnd);
   return w ? w->sdl : nullptr;
+}
+
+bool PointerGrabAllowed(SDL_Window* w) {
+  if (!w || Background()) return false;
+  return Game().grab_pointer_in_window || (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN);
 }
 
 void SetExclusiveMode(uint32_t hwnd, int w, int h) {
@@ -2209,7 +2225,7 @@ HLE("user32.dll", ClipCursor, 1) {
     }
   }
   if (release && release != grab) SDL_SetWindowRelativeMouseMode(release, false);
-  if (grab && !Background()) SDL_SetWindowRelativeMouseMode(grab, true);
+  if (grab && PointerGrabAllowed(grab)) SDL_SetWindowRelativeMouseMode(grab, true);
   return 1;
 }
 

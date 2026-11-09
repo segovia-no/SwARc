@@ -52,6 +52,20 @@ struct GameConfig : recomp::GameConfig {
   };
   Fullscreen fullscreen = Fullscreen::Desktop;
 
+  // An exclusive DirectInput mouse or a ClipCursor rectangle confines the
+  // pointer, as on Windows: the host pointer is grabbed (hidden, relative
+  // motion). false: only while the window is fullscreen; in a window the
+  // pointer stays free, for games that use the mouse only for buttons and
+  // menus, where a captured pointer just gets in the way of the desktop.
+  bool grab_pointer_in_window = true;
+
+  // A quit request from the host (the app's Quit menu item and Cmd+Q on
+  // macOS, the Dock, the window's close button) is posted to the game's
+  // windows as WM_CLOSE. true: it ends the process at once instead (as
+  // ExitProcess(0)), for games that ignore WM_CLOSE and only quit from
+  // their own menus.
+  bool quit_on_close_request = false;
+
   // Video memory DirectDraw reports, in MB. Games pick detail settings
   // from it; a game's best profile may need more than the default.
   uint32_t video_memory_mb = 64;
